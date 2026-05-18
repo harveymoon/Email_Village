@@ -22,7 +22,13 @@ plans/
 
 # Internal dev / debug folders
 debug/
-docs/
+# docs/ is mostly private (research notes etc) — exclude its contents
+# directly so the negation below can still let docs/screenshots/ through.
+# (Negating inside a fully-excluded directory doesn't work; you must
+# leave the directory itself trackable.)
+docs/*
+!docs/screenshots/
+!docs/screenshots/**
 bridge_templates/
 
 # Misc dev scripts not part of the runtime project

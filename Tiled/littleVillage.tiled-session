@@ -1,0 +1,131 @@
+{
+    "activeFile": "First_Map.tmx",
+    "expandedProjectPaths": [
+        "."
+    ],
+    "fileStates": {
+        "11_Camping_48x48.tsx": {
+            "scaleInDock": 0.5,
+            "scaleInEditor": 1
+        },
+        "16_Office_48x48.tsx": {
+            "scaleInDock": 0.5,
+            "scaleInEditor": 0.5
+        },
+        "22_Post_Office_48x48.tsx": {
+            "scaleInDock": 0.5,
+            "scaleInEditor": 1
+        },
+        "24_Additional_Houses_48x48.tsx": {
+            "scaleInDock": 0.5,
+            "scaleInEditor": 1
+        },
+        "3_City_Props_48x48.tsx": {
+            "scaleInDock": 1,
+            "scaleInEditor": 1
+        },
+        "4_Generic_Buildings_48x48.tsx": {
+            "scaleInDock": 0.5,
+            "scaleInEditor": 1
+        },
+        "7_Villas_48x48.tsx": {
+            "scaleInDock": 0.5,
+            "scaleInEditor": 1
+        },
+        "9_Shopping_Center_and_Markets_48x48.tsx": {
+            "scaleInDock": 0.5,
+            "scaleInEditor": 1
+        },
+        "A2_Floors_MV_TILESET.tsx": {
+            "scaleInDock": 1,
+            "scaleInEditor": 1
+        },
+        "C:/CODE/Little_Town/little_town/public/assets/tilemaps/tuxemon-town.tmx": {
+            "scale": 0.595234375,
+            "selectedLayer": 0,
+            "viewCenter": {
+                "x": 639.2439952749705,
+                "y": 640.0840005250034
+            }
+        },
+        "C:/CODE/Little_Town/little_town/public/assets/tilemaps/tuxemon-town.tmx#tuxmon-sample-32px-extruded": {
+            "scaleInDock": 1,
+            "scaleInEditor": 1
+        },
+        "First_Map.tmx": {
+            "scale": 0.75,
+            "selectedLayer": 0,
+            "viewCenter": {
+                "x": -246.66666666666663,
+                "y": 546
+            }
+        },
+        "Floors.tsx": {
+            "dynamicWrapping": false,
+            "scaleInDock": 0.5,
+            "scaleInEditor": 1
+        },
+        "Grass_Path.tsx": {
+            "dynamicWrapping": false,
+            "scaleInDock": 0.5,
+            "scaleInEditor": 4
+        },
+        "Grass_Water.tsx": {
+            "dynamicWrapping": false,
+            "scaleInDock": 1,
+            "scaleInEditor": 1
+        },
+        "Grass_Water_2.tsx": {
+            "dynamicWrapping": true,
+            "scaleInDock": 0.25,
+            "scaleInEditor": 1
+        },
+        "Sand Grass.tsx": {
+            "dynamicWrapping": true,
+            "scaleInDock": 1,
+            "scaleInEditor": 1
+        },
+        "Terrains.tsx": {
+            "scaleInDock": 0.5,
+            "scaleInEditor": 0.5
+        },
+        "shallow water.tsx": {
+            "dynamicWrapping": false,
+            "scaleInDock": 0.5,
+            "scaleInEditor": 1
+        }
+    },
+    "last.externalTilesetPath": "C:/CODE/Little_Town/Tiled",
+    "last.imagePath": "C:/CODE/Little_Town/assets/Modern_Exteriors_48x48/ME_Theme_Sorter_48x48",
+    "map.height": 40,
+    "map.lastUsedFormat": "tmx",
+    "map.tileHeight": 48,
+    "map.tileWidth": 48,
+    "map.width": 40,
+    "openFiles": [
+        "First_Map.tmx",
+        "shallow water.tsx"
+    ],
+    "project": "littleVillage.tiled-project",
+    "property.type": "bool",
+    "recentFiles": [
+        "shallow water.tsx",
+        "First_Map.tmx",
+        "11_Camping_48x48.tsx",
+        "Terrains.tsx",
+        "3_City_Props_48x48.tsx",
+        "24_Additional_Houses_48x48.tsx",
+        "22_Post_Office_48x48.tsx",
+        "16_Office_48x48.tsx",
+        "7_Villas_48x48.tsx",
+        "4_Generic_Buildings_48x48.tsx",
+        "9_Shopping_Center_and_Markets_48x48.tsx",
+        "Grass_Path.tsx"
+    ],
+    "tileset.lastUsedFormat": "tsx",
+    "tileset.tileSize": {
+        "height": 48,
+        "width": 48
+    },
+    "tileset.type": 0
+}

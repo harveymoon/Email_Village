@@ -1,0 +1,68 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-error.log
+dist/
+build/
+
+# Backend secrets — never commit
+backend/.env
+backend/.gmail-tokens.json
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
+
+# Claude / planning artifacts (private)
+.claude/
+plans/
+
+# Internal dev / debug folders
+debug/
+docs/
+bridge_templates/
+
+# Misc dev scripts not part of the runtime project
+apply_grass_pattern.py
+extract_bridge_templates.py
+preprocess.py
+generate.js
+split_noncontiguous_items.py
+# Stale older root-level server (replaced by backend/server.js)
+/server.js
+# Stale older static folder (replaced by little_town/public/)
+/public/
+# Large unused tile pack
+SERENE_VILLAGE_REVAMPED/
+
+# Debug output from generator / tile-identification scripts
+preview_map.png
+tile_reference.png
+samp_*.png
+sample_*.png
+tiles_strip_*.png
+Trace-*.json
+
+# Licensed LimeZu Modern Interiors / Exteriors assets — NEVER COMMIT.
+# Buy your own copy at https://limezu.itch.io/ and place the PNGs
+# back where the README's "Building your own map" section describes.
+# We commit only the Tiled .tmx + .tsx authoring files (which
+# reference these PNGs by relative path) and the exported map JSON.
+# Top-level raw asset library (leading slash = root only — must not
+# also ignore little_town/public/assets/tilemaps/ which holds the map JSON):
+/assets/
+# Tileset slices copied into the served public folder:
+little_town/public/assets/tilesets/*.png
+# LimeZu Modern Interiors character generator copies:
+little_town/public/assets/characters/**/*.png
+little_town/public/assets/character_builder/**/*.png
+little_town/public/assets/character_builder/**/manifest.json
+little_town/public/assets/character_builder/Spritesheet_animations_GUIDE.png
+little_town/public/assets/Modern_Interiors/
+# Debug trace images:
+little_town/public/assets/trace/
+# Tuxemon-town tutorial sample (unused — was Phaser learning-material):
+little_town/public/assets/tilemaps/tuxemon-town.*

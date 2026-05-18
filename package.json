@@ -1,0 +1,10 @@
+{
+  "name": "little-town",
+  "version": "0.1.0",
+  "description": "Game Boy-style RPG prototype with a tile editor",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "gen": "node generate.js"
+  }
+}

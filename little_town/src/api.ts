@@ -1,0 +1,154 @@
+// Thin wrapper around the Town Inbox backend (Express + googleapis).
+// Default port is 3091; override by creating little_town/.env with:
+//   VITE_API_BASE=http://localhost:<port>
+// Every request goes with credentials: 'include' so the OAuth session
+// cookie travels back. Backend CORS allows any localhost origin.
+
+export const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) || 'http://localhost:3091';
+
+export interface AccountSummary { email: string; name?: string; picture?: string }
+
+export interface AuthStatus {
+  authenticated: boolean;
+  accounts: AccountSummary[];
+}
+
+export interface GmailLabel {
+  id: string;         // prefixed: "<account>:<labelId>"
+  rawId: string;      // unprefixed Gmail label id
+  account: string;    // owning account email
+  name: string;
+  type?: string;
+  color?: string | null;
+}
+
+export interface EmailParticipant { name: string; email: string; avatar: string | null; }
+
+export interface EmailMessage {
+  id: string;             // prefixed: "<account>:<messageId>"
+  threadId: string;       // prefixed: "<account>:<threadId>"
+  account: string;        // owning account email
+  from: EmailParticipant;
+  to: string;
+  subject: string;
+  snippet: string;
+  body: string;
+  bodyHtml: string;
+  date: string;
+  labels: string[];
+  isRead: boolean;
+  isStarred: boolean;
+  hasAttachment: boolean;
+  unsubscribeUrl?: string | null;
+}
+
+export interface EmailThread {
+  id: string;             // prefixed
+  threadId: string;       // prefixed
+  account: string;        // owning account email
+  messageCount: number;
+  from: EmailParticipant;
+  to: string;
+  subject: string;
+  snippet: string;
+  date: string;
+  labels: string[];
+  isRead: boolean;
+  isStarred: boolean;
+  hasAttachment: boolean;
+  messages: EmailMessage[];
+  originalFrom: EmailParticipant;
+}
+
+// Subscribe to auth-expired events. The scene's bootstrapAuth registers
+// here so any API 401 across the app re-opens the sign-in modal without
+// requiring callers to handle auth flow themselves.
+type AuthExpiredHandler = () => void;
+let onAuthExpired: AuthExpiredHandler | null = null;
+export function setAuthExpiredHandler(fn: AuthExpiredHandler): void { onAuthExpired = fn; }
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  // Retry once on TypeError ("Failed to fetch") — usually means the
+  // backend hot-restarted (--watch) mid-request and dropped the
+  // connection. A 400-500ms wait is enough to let Node re-bind.
+  let resp: Response;
+  try {
+    resp = await fetch(`${API_BASE}${path}`, {
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) },
+      ...init,
+    });
+  } catch (err) {
+    if (err instanceof TypeError) {
+      console.warn(`[api] transient fetch error on ${path}; retrying in 500ms…`);
+      await new Promise(r => setTimeout(r, 500));
+      try {
+        resp = await fetch(`${API_BASE}${path}`, {
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) },
+          ...init,
+        });
+      } catch (err2) {
+        throw new Error(`Backend at ${API_BASE} unreachable. Check that the TownInbox-Backend window is still running.`);
+      }
+    } else {
+      throw err;
+    }
+  }
+  if (!resp.ok) {
+    let body: any = null;
+    try { body = await resp.json(); } catch { /* not JSON */ }
+    if (resp.status === 401) {
+      if (onAuthExpired) try { onAuthExpired(); } catch { /* ignore */ }
+      throw new Error(`auth_expired: ${body?.message || 'not authenticated'}`);
+    }
+    const detail = body ? JSON.stringify(body) : await resp.text();
+    throw new Error(`HTTP ${resp.status} ${path}: ${detail}`);
+  }
+  return resp.json() as Promise<T>;
+}
+
+export const api = {
+  authStatus:  () => request<AuthStatus>('/auth/status'),
+  profile:     () => request<{ accounts: Array<{ account: string; email: string; messagesTotal?: number; threadsTotal?: number; error?: string }> }>('/api/profile'),
+  labels:      () => request<GmailLabel[]>('/api/labels'),
+  threads:     (q: string, maxResults = 100) => request<{ emails: EmailThread[]; nextPageToken: string | null; resultSizeEstimate: number }>(`/api/emails?q=${encodeURIComponent(q)}&maxResults=${maxResults}`),
+  // Pass either a labelName (resolved per-account on backend) or labelIds
+  // (comma-separated; prefixed `<account>:<labelId>` or system label 'INBOX').
+  unreadCount: (opts: { labelName?: string; labelIds?: string }) => {
+    const q = opts.labelName
+      ? `labelName=${encodeURIComponent(opts.labelName)}`
+      : `labelIds=${encodeURIComponent(opts.labelIds || '')}`;
+    return request<{ count: number; breakdown: Record<string, number> }>(`/api/unread-count?${q}`);
+  },
+  thread:      (prefixedId: string) => request<EmailThread>(`/api/threads/${encodeURIComponent(prefixedId)}`),
+  modify:      (prefixedId: string, addLabels: string[], removeLabels: string[]) =>
+                 request<{ success: boolean; account: string }>(`/api/emails/${encodeURIComponent(prefixedId)}/labels`, {
+                   method: 'PATCH',
+                   body: JSON.stringify({ addLabels, removeLabels }),
+                 }),
+  markRead:    (prefixedId: string, isRead: boolean) =>
+                 request<{ success: boolean; account: string }>(`/api/emails/${encodeURIComponent(prefixedId)}/read`, {
+                   method: 'PATCH',
+                   body: JSON.stringify({ isRead }),
+                 }),
+  reply:       (prefixedThreadId: string, body: string, to?: string) =>
+                 request<{ success: boolean; account: string; id: string; threadId: string }>(`/api/threads/${encodeURIComponent(prefixedThreadId)}/reply`, {
+                   method: 'POST',
+                   body: JSON.stringify({ body, to }),
+                 }),
+  disconnect:  (email: string) => request<{ success: boolean; remaining: string[] }>(`/auth/disconnect/${encodeURIComponent(email)}`, { method: 'POST' }),
+  signInUrl:   (addAccount = false) =>
+                 `${API_BASE}/auth/google?return_to=${encodeURIComponent(window.location.origin + window.location.pathname)}${addAccount ? '&add=true' : ''}`,
+  reauthUrl:   (email: string) =>
+                 `${API_BASE}/auth/google?return_to=${encodeURIComponent(window.location.origin + window.location.pathname)}&reauth=${encodeURIComponent(email)}`,
+  // ---- Gmail filters / rules ----
+  filters:     () => request<Array<{ id: string; rawId?: string; account: string; criteria?: any; action?: any; error?: string; message?: string }>>('/api/filters'),
+  createFilter: (account: string, criteria: any, action: any) =>
+                  request<{ success: boolean; id: string; rawId: string; account: string }>(`/api/filters?account=${encodeURIComponent(account)}`, {
+                    method: 'POST',
+                    body: JSON.stringify({ criteria, action }),
+                  }),
+  deleteFilter: (prefixedId: string) =>
+                  request<{ success: boolean; account: string }>(`/api/filters/${encodeURIComponent(prefixedId)}`, { method: 'DELETE' }),
+};

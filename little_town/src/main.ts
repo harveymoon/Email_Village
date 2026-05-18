@@ -883,11 +883,18 @@ class VillageScene extends Phaser.Scene {
     document.body.appendChild(tooltipEl);
     this.input.on('pointermove', (pointer: Phaser.Input.Pointer) => {
       const wx = pointer.worldX, wy = pointer.worldY;
-      // NPC hit-test first.
-      const hitNpc = this.npcs.find(n => {
-        const b = n.sprite.getBounds();
-        return Phaser.Geom.Rectangle.Contains(b, wx, wy);
-      });
+      // NPC hit-test first — center-distance check so moving sprites
+      // still get the hover tooltip (strict bounds-containment misses
+      // anyone walking faster than the cursor).
+      const HOVER_RADIUS = 28;
+      let hitNpc: NPC | undefined;
+      let hitDist = HOVER_RADIUS;
+      for (const n of this.npcs) {
+        const dx = n.sprite.x - wx;
+        const dy = n.sprite.y - wy;
+        const d = Math.hypot(dx, dy);
+        if (d <= hitDist) { hitDist = d; hitNpc = n; }
+      }
       if (hitNpc) {
         const data = (hitNpc.data || {}) as any;
         // Each NPC carries 1+ threads for ONE sender. Resolve subject(s)
@@ -981,10 +988,20 @@ class VillageScene extends Phaser.Scene {
         // NPC hit-test first — sprites are smaller than building rects,
         // so checking them first means clicking an NPC inside a
         // building doesn't open the building popup.
-        const hitNpc = this.npcs.find(n => {
-          const b = n.sprite.getBounds();
-          return Phaser.Geom.Rectangle.Contains(b, wx, wy);
-        });
+        // We use a CENTER-DISTANCE check (with a generous radius)
+        // rather than strict sprite-bounds containment so moving NPCs
+        // stay clickable — by the time the click event fires the
+        // sprite may have moved a few pixels past where the cursor
+        // landed. The closest NPC within the radius wins.
+        const HIT_RADIUS = 28;          // ~half the 48-tile sprite
+        let hitNpc: NPC | undefined;
+        let hitDist = HIT_RADIUS;
+        for (const n of this.npcs) {
+          const dx = n.sprite.x - wx;
+          const dy = n.sprite.y - wy;
+          const d = Math.hypot(dx, dy);
+          if (d <= hitDist) { hitDist = d; hitNpc = n; }
+        }
         const hitNpcData = (hitNpc?.data || {}) as any;
         const hitNpcHasThread =
           (Array.isArray(hitNpcData.threadIds) && hitNpcData.threadIds.length > 0) ||
@@ -3472,6 +3489,9 @@ class VillageScene extends Phaser.Scene {
   // player update loop switches to playing `<key>-walk-<dir>` anims
   // and standing on `AVATAR_FRAMES.stand<Dir>` instead of misa-*.
   private playerTextureKey: string = '';
+  // Cardinal facing — updated whenever the player has a non-zero
+  // velocity, so calls/dialogue know which way to deliver an NPC.
+  private playerFacingDir: 'down' | 'up' | 'left' | 'right' = 'down';
   private buildTopBar(): void {
     if (this.topBarEl) { this.topBarEl.remove(); this.topBarEl = null; }
     // Collapsed state persists across sessions.
@@ -3878,41 +3898,99 @@ class VillageScene extends Phaser.Scene {
     const TILE = 48;
     const playerTx = (player.x / TILE) | 0;
     const playerTy = (player.y / TILE) | 0;
-    // Find a walkable tile adjacent to the player as the meet point.
-    // Prefer tiles that are not on the player's exact cell so the NPC
-    // doesn't try to stand on top of them; ring outward if blocked.
     const cols = this.grid.cols;
     const rows = this.grid.rows;
+    // Try the tile directly in front of the player first (their
+    // current facing). If that's blocked, rotate them through the
+    // other 3 cardinal directions until one is walkable — keeps the
+    // delivery slot "in front" even when the player is facing a wall.
+    // Fall back to a ring-search if all four cardinals are blocked
+    // (player wedged into a corner).
+    const offsets: Record<'down' | 'up' | 'left' | 'right', [number, number]> = {
+      down:  [0,  1],
+      up:    [0, -1],
+      left:  [-1, 0],
+      right: [1,  0],
+    };
+    const isWalkable = (tx: number, ty: number) =>
+      tx >= 0 && ty >= 0 && tx < cols && ty < rows && !this.grid.cells[ty * cols + tx];
+    const tryOrder: Array<'down' | 'up' | 'left' | 'right'> = [this.playerFacingDir];
+    for (const d of ['down', 'up', 'left', 'right'] as const) if (d !== this.playerFacingDir) tryOrder.push(d);
     let meetX = playerTx, meetY = playerTy;
-    outer: for (let r = 1; r <= 4; r++) {
-      for (let dy = -r; dy <= r; dy++) {
-        for (let dx = -r; dx <= r; dx++) {
-          if (Math.abs(dx) !== r && Math.abs(dy) !== r) continue;
-          const tx = playerTx + dx, ty = playerTy + dy;
-          if (tx < 0 || ty < 0 || tx >= cols || ty >= rows) continue;
-          if (!this.grid.cells[ty * cols + tx]) {
-            meetX = tx; meetY = ty;
-            break outer;
+    let usedDir: 'down' | 'up' | 'left' | 'right' = this.playerFacingDir;
+    let found = false;
+    for (const d of tryOrder) {
+      const [ox, oy] = offsets[d];
+      const tx = playerTx + ox, ty = playerTy + oy;
+      if (isWalkable(tx, ty)) {
+        meetX = tx; meetY = ty; usedDir = d; found = true; break;
+      }
+    }
+    if (!found) {
+      // Player is fully boxed in. Ring outward as a last resort.
+      outer: for (let r = 2; r <= 4; r++) {
+        for (let dy = -r; dy <= r; dy++) {
+          for (let dx = -r; dx <= r; dx++) {
+            if (Math.abs(dx) !== r && Math.abs(dy) !== r) continue;
+            const tx = playerTx + dx, ty = playerTy + dy;
+            if (isWalkable(tx, ty)) { meetX = tx; meetY = ty; break outer; }
           }
         }
       }
+      // usedDir stays as facing — won't matter since arrival is far away.
     }
+    // Rotate the player to look toward the meet tile if the call had
+    // to use a non-facing direction (or even confirm the original).
+    this.playerFacingDir = usedDir;
+    this.setPlayerStandFrame(usedDir);
+
     const meetDoor: Door = {
       x: meetX * TILE + TILE / 2,
       y: meetY * TILE + TILE / 2,
       tx: meetX, ty: meetY,
     };
-    // Queue the walk. On arrival, open the click-action popup for this
-    // NPC near the meet point's screen position.
     const npcRef = best;
+    // Opposite of player's facing — the NPC should turn around to look
+    // back at the player on arrival.
+    const opposite: Record<'down' | 'up' | 'left' | 'right', 'down' | 'up' | 'left' | 'right'> = {
+      down: 'up', up: 'down', left: 'right', right: 'left',
+    };
+    const npcFaceDir = opposite[usedDir];
     npcRef.queueWalk(meetDoor, () => {
-      // Compute the NPC's current screen position for the popup anchor.
+      // Stop the walk anim and snap the NPC to a stand-frame pointing
+      // back at the player so the popup feels like a face-to-face chat.
+      npcRef.sprite.anims.stop();
+      const standFrame = AVATAR_FRAMES[
+        `stand${npcFaceDir.charAt(0).toUpperCase()}${npcFaceDir.slice(1)}` as
+          keyof typeof AVATAR_FRAMES
+      ];
+      if (typeof standFrame === 'number') npcRef.sprite.setFrame(standFrame);
+      // Anchor the popup at the NPC's CURRENT screen position.
       const cam = this.cameras.main;
       const sx = npcRef.sprite.x - cam.scrollX;
       const sy = npcRef.sprite.y - cam.scrollY;
       this.openNpcActionMenu(npcRef, sx, sy);
     }, 'you');
-    console.log(`[call] summoned closest NPC (${(best.data as any)?.fromEmail || '?'}) to (${meetX}, ${meetY})`);
+    console.log(`[call] summoned NPC (${(best.data as any)?.fromEmail || '?'}) to ${usedDir} of player at (${meetX}, ${meetY})`);
+  }
+
+  // Snap the player sprite to a static stand frame in the given
+  // direction. Works with both the legacy 'atlas' misa-* texture and
+  // the new layered avatar (`playerTextureKey`).
+  private setPlayerStandFrame(dir: 'down' | 'up' | 'left' | 'right'): void {
+    player.anims.stop();
+    if (this.playerTextureKey) {
+      const fr = AVATAR_FRAMES[
+        `stand${dir.charAt(0).toUpperCase()}${dir.slice(1)}` as keyof typeof AVATAR_FRAMES
+      ];
+      if (typeof fr === 'number') player.setTexture(this.playerTextureKey, fr);
+    } else {
+      const misa = dir === 'down' ? 'misa-front'
+                 : dir === 'up'   ? 'misa-back'
+                 : dir === 'left' ? 'misa-left'
+                                  : 'misa-right';
+      player.setTexture('atlas', misa);
+    }
   }
 
   // ---- Off-screen unread arrow ----
@@ -4117,6 +4195,13 @@ class VillageScene extends Phaser.Scene {
     else if (down)  player.body.setVelocityY(speed);
 
     player.body.velocity.normalize().scale(speed);
+
+    // Track cardinal facing — used by callNearestNpc to deliver the
+    // NPC in front of the player and to spin them to face each other.
+    if (left)       this.playerFacingDir = 'left';
+    else if (right) this.playerFacingDir = 'right';
+    else if (up)    this.playerFacingDir = 'up';
+    else if (down)  this.playerFacingDir = 'down';
 
     // Player anim key namespace switches at runtime: until the layered
     // avatar texture composes (async), we play the legacy `misa-*`

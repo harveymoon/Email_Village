@@ -102,15 +102,24 @@ export async function composeAndRegisterAvatar(scene: Phaser.Scene, cfg: AvatarC
       inFlight.delete(textureKey);
       throw new Error(`[avatar-texture] body sheet failed to load (${cfg.body}); refusing to composite invisible-skin avatar`);
     }
-    // Composite onto a single canvas matching the LimeZu sheet dims.
+    // Composite onto a canvas covering ONLY the rows we actually use
+    // (R0 stand · R1 idle · R2 walk · R3 unused · R4 sit). Each row is
+    // 96 px, so the canvas is 5 * 96 = 480 px tall instead of the full
+    // 1968. Memory drops from ~22MB → ~5MB per unique avatar texture,
+    // which keeps the tab alive with many distinct senders.
+    // Frame indexing stays valid because rows 0-4 retain their source
+    // positions — we just truncated rows 5+ which weren't referenced
+    // by any animation.
+    const USED_ROWS = 5;
+    const cropH = USED_ROWS * FRAME_H;     // 480
     const canvas = document.createElement('canvas');
     canvas.width = SHEET_W;
-    canvas.height = SHEET_H;
+    canvas.height = cropH;
     const ctx = canvas.getContext('2d');
     if (!ctx) throw new Error('2d context unavailable');
     ctx.imageSmoothingEnabled = false;
     for (const img of imgs) {
-      if (img) ctx.drawImage(img, 0, 0);
+      if (img) ctx.drawImage(img, 0, 0, SHEET_W, cropH, 0, 0, SHEET_W, cropH);
     }
     // Race: another call may have registered the texture between our
     // exists() check above and now. addCanvas would throw.
@@ -120,11 +129,9 @@ export async function composeAndRegisterAvatar(scene: Phaser.Scene, cfg: AvatarC
       console.error(`[avatar-texture] addCanvas returned null for ${textureKey}`);
       return textureKey;
     }
-    // Manually slice the canvas into 48×96 frames laid out row-major.
-    // We cap at row 20 (the last partial row at y=1920-1968 is too
-    // short for a 96-tall frame anyway).
-    const rows = Math.floor(SHEET_H / FRAME_H);     // 20
-    for (let r = 0; r < rows; r++) {
+    // Register only the frames in the cropped region (rows 0-4).
+    // Animations only ever reference these rows; nothing else is needed.
+    for (let r = 0; r < USED_ROWS; r++) {
       for (let c = 0; c < SHEET_COLS; c++) {
         tex.add(r * SHEET_COLS + c, 0, c * FRAME_W, r * FRAME_H, FRAME_W, FRAME_H);
       }

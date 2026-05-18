@@ -255,21 +255,136 @@ class VillageScene extends Phaser.Scene {
     try { localStorage.setItem(VillageScene.THREAD_LIMIT_STORAGE, String(v)); } catch {}
   }
 
+  // Persistent label-thread cache. Backed by localStorage with a TTL
+  // so dev-mode page reloads don't burn through Gmail's per-minute
+  // quota refetching the same data. Stripped to metadata + snippet
+  // (no full message bodies) to fit comfortably in localStorage.
+  // TTL is user-configurable via Settings (default 15 min).
+  private static CACHE_TTL_KEY = 'little_town.thread_cache_ttl_min';
+  private static CACHE_TTL_DEFAULT_MIN = 15;
+  private getCacheTtlMs(): number {
+    try {
+      const raw = localStorage.getItem(VillageScene.CACHE_TTL_KEY);
+      if (raw) {
+        const v = parseInt(raw, 10);
+        if (Number.isFinite(v) && v >= 0) return v * 60_000;
+      }
+    } catch {/* fall through */}
+    return VillageScene.CACHE_TTL_DEFAULT_MIN * 60_000;
+  }
+  private cacheKey(label: string): string { return `little_town.threads.${label}`; }
+  private loadFromPersistentCache(label: string): EmailThread[] | null {
+    try {
+      const raw = localStorage.getItem(this.cacheKey(label));
+      if (!raw) return null;
+      const { t, v } = JSON.parse(raw);
+      if (typeof t !== 'number' || !Array.isArray(v)) return null;
+      const ttl = this.getCacheTtlMs();
+      if (ttl > 0 && Date.now() - t > ttl) return null;
+      return v as EmailThread[];
+    } catch { return null; }
+  }
+  private saveToPersistentCache(label: string, threads: EmailThread[]): void {
+    // Strip heavy body fields — re-fetched on demand when the user
+    // actually opens a thread. Keeps the localStorage footprint sane.
+    const slim = threads.map(t => ({
+      ...t,
+      messages: t.messages?.map(m => ({ ...m, body: '', bodyHtml: '' })) || [],
+    }));
+    try {
+      localStorage.setItem(this.cacheKey(label), JSON.stringify({ t: Date.now(), v: slim }));
+    } catch (err) {
+      // localStorage quota exceeded — drop oldest entries and retry once.
+      this.evictOldestPersistentCache();
+      try { localStorage.setItem(this.cacheKey(label), JSON.stringify({ t: Date.now(), v: slim })); }
+      catch { console.warn('[cache] still over quota after eviction, skipping persist for', label); }
+    }
+  }
+  private evictOldestPersistentCache(): void {
+    const entries: Array<{ key: string; t: number }> = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (!k || !k.startsWith('little_town.threads.')) continue;
+      try {
+        const { t } = JSON.parse(localStorage.getItem(k) || '{}');
+        if (typeof t === 'number') entries.push({ key: k, t });
+      } catch {}
+    }
+    entries.sort((a, b) => a.t - b.t);
+    // Drop the oldest 25% to make room.
+    const dropN = Math.max(1, Math.floor(entries.length * 0.25));
+    for (let i = 0; i < dropN; i++) {
+      try { localStorage.removeItem(entries[i].key); } catch {}
+    }
+    console.log(`[cache] evicted ${dropN} oldest entries to free space`);
+  }
+  private invalidatePersistentCache(label: string): void {
+    try { localStorage.removeItem(this.cacheKey(label)); } catch {}
+  }
+  // Backoff state when Gmail returns a 429 / rateLimitExceeded /
+  // userRateLimitExceeded / quota error. We stop fetching for N
+  // seconds, then resume. Per-account would be nicer; per-session is
+  // good enough for now.
+  private apiBackoffUntilMs = 0;
+  private isInBackoff(): boolean {
+    return Date.now() < this.apiBackoffUntilMs;
+  }
+  private triggerBackoff(seconds: number): void {
+    this.apiBackoffUntilMs = Math.max(this.apiBackoffUntilMs, Date.now() + seconds * 1000);
+    console.warn(`[cache] backoff for ${seconds}s — Gmail quota exhausted`);
+  }
+
   private async loadThreadsForLabel(labelName: string, force = false, limit?: number): Promise<EmailThread[]> {
     if (!force && this.emailCache.has(labelName)) return this.emailCache.get(labelName)!;
     if (!force && this.emailFetchPromises.has(labelName)) return this.emailFetchPromises.get(labelName)!;
+    // Try persistent cache before going to the network — this is the
+    // single biggest reason quota stays low during dev iteration.
+    if (!force) {
+      const cached = this.loadFromPersistentCache(labelName);
+      if (cached) {
+        this.emailCache.set(labelName, cached);
+        return cached;
+      }
+    }
+    // If Gmail recently rate-limited us, fall through to whatever
+    // memory cache has (probably nothing) rather than queue more 429s.
+    if (this.isInBackoff()) {
+      return this.emailCache.get(labelName) || [];
+    }
     const queryLabel = labelName;
     const cap = limit ?? this.getThreadLimit();
     const p = api.threads(`label:"${queryLabel}"`, cap).then(resp => {
       this.emailCache.set(labelName, resp.emails);
+      this.saveToPersistentCache(labelName, resp.emails);
       this.emailFetchPromises.delete(labelName);
       return resp.emails;
     }).catch(err => {
       this.emailFetchPromises.delete(labelName);
+      // Detect Gmail quota errors and back off so we stop hammering.
+      const msg = String(err?.message || err);
+      if (/quota|rate.?limit|429|userRateLimit/i.test(msg)) {
+        this.triggerBackoff(60);
+      }
       throw err;
     });
     this.emailFetchPromises.set(labelName, p);
     return p;
+  }
+
+  // Clear every persistent label cache entry. Wired to the Settings
+  // popup's "Clear cache" button — handy when iterating during dev or
+  // when stale data is causing weird UI.
+  clearPersistentCache(): number {
+    const keys: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith('little_town.threads.')) keys.push(k);
+    }
+    for (const k of keys) {
+      try { localStorage.removeItem(k); } catch {}
+    }
+    this.emailCache.clear();
+    return keys.length;
   }
 
   // Background: after the bound buildings have spawned their NPCs,
@@ -3009,8 +3124,13 @@ class VillageScene extends Phaser.Scene {
     // Invalidate every cache touched: INBOX + the chosen label + every
     // other label this building binds (their thread counts might shift).
     this.emailCache.delete('INBOX');
-    for (const n of candidateLabels) this.emailCache.delete(n);
+    this.invalidatePersistentCache('INBOX');
+    for (const n of candidateLabels) {
+      this.emailCache.delete(n);
+      this.invalidatePersistentCache(n);
+    }
     this.emailCache.delete(chosen);     // covers the override-floor case
+    this.invalidatePersistentCache(chosen);
 
     const destDoor = this.findDoorForBuilding(destBuilding);
     if (!destDoor) {
@@ -3118,8 +3238,13 @@ class VillageScene extends Phaser.Scene {
     // the building popup re-renders the new floor, plus any sub-label
     // we just removed and the one we just added.
     this.emailCache.delete(opt.parent);
-    for (const n of toRemove) this.emailCache.delete(n);
+    this.invalidatePersistentCache(opt.parent);
+    for (const n of toRemove) {
+      this.emailCache.delete(n);
+      this.invalidatePersistentCache(n);
+    }
     this.emailCache.delete(opt.fullName);
+    this.invalidatePersistentCache(opt.fullName);
   }
 
   // Move EVERY thread carried by a specific NPC to one destination in
@@ -3167,8 +3292,15 @@ class VillageScene extends Phaser.Scene {
       catch (err) { console.warn(`[moveAll] failed for ${tid}:`, err); }
     }
     this.emailCache.delete('INBOX');
-    for (const n of candidateLabels) this.emailCache.delete(n);
-    if (overrideLabel) this.emailCache.delete(overrideLabel);
+    this.invalidatePersistentCache('INBOX');
+    for (const n of candidateLabels) {
+      this.emailCache.delete(n);
+      this.invalidatePersistentCache(n);
+    }
+    if (overrideLabel) {
+      this.emailCache.delete(overrideLabel);
+      this.invalidatePersistentCache(overrideLabel);
+    }
 
     // Drain the NPC's thread list and walk once.
     data.threadIds = [];
@@ -3551,6 +3683,59 @@ class VillageScene extends Phaser.Scene {
     npcRow.appendChild(applyBtn);
     npcRow.appendChild(npcStatus);
     body.appendChild(npcRow);
+
+    // ---- Local thread cache ----
+    // Saves fetched threads to localStorage so a page reload doesn't
+    // re-fetch from Gmail until the TTL expires. The single biggest
+    // reason quota stays under control during dev iteration.
+    body.appendChild(this.sectionLabel('Local cache'));
+    const cacheRow = document.createElement('div');
+    cacheRow.style.cssText = 'display:flex; gap:10px; align-items:center; flex-wrap:wrap;';
+    const cacheLabel = document.createElement('label');
+    cacheLabel.style.cssText = 'color:#ccc; font:13px ui-sans-serif,system-ui,sans-serif;';
+    cacheLabel.textContent = 'Cache TTL (minutes, 0 = disable):';
+    const ttlMin = Math.round(this.getCacheTtlMs() / 60_000);
+    const cacheInput = document.createElement('input');
+    cacheInput.type = 'number'; cacheInput.min = '0'; cacheInput.max = '1440'; cacheInput.step = '1';
+    cacheInput.value = String(ttlMin);
+    cacheInput.style.cssText = 'background:#0b0b0b; color:#eee; border:1px solid #333; border-radius:5px; padding:5px 8px; font:13px ui-monospace,Consolas,monospace; width:70px;';
+    cacheInput.addEventListener('change', () => {
+      const v = parseInt(cacheInput.value, 10);
+      if (Number.isFinite(v) && v >= 0) {
+        try { localStorage.setItem(VillageScene.CACHE_TTL_KEY, String(v)); } catch {}
+        cacheStatus.textContent = `Saved. New TTL: ${v} min.`;
+      }
+    });
+    const clearCacheBtn = document.createElement('button');
+    clearCacheBtn.textContent = 'Clear cache + re-fetch';
+    clearCacheBtn.style.cssText = 'background:#3b1f1f; color:#fcc; border:1px solid #5a2a2a; border-radius:5px; padding:5px 12px; cursor:pointer; font:600 12px ui-sans-serif,system-ui,sans-serif;';
+    const cacheStatus = document.createElement('span');
+    cacheStatus.style.cssText = 'color:#888; font:11px ui-monospace,Consolas,monospace;';
+    // Show how big the persistent cache currently is.
+    const summarizeCache = () => {
+      let count = 0, bytes = 0;
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (!k || !k.startsWith('little_town.threads.')) continue;
+        count++;
+        bytes += (localStorage.getItem(k) || '').length;
+      }
+      cacheStatus.textContent = `${count} label${count === 1 ? '' : 's'} cached · ${(bytes / 1024).toFixed(0)} KB`;
+    };
+    summarizeCache();
+    clearCacheBtn.addEventListener('click', async () => {
+      clearCacheBtn.disabled = true;
+      const cleared = this.clearPersistentCache();
+      cacheStatus.textContent = `Cleared ${cleared} cached labels. Refetching…`;
+      try { await this.respawnEmailNPCs(); summarizeCache(); }
+      catch (err) { cacheStatus.textContent = `Refetch failed: ${err}`; }
+      finally { clearCacheBtn.disabled = false; }
+    });
+    cacheRow.appendChild(cacheLabel);
+    cacheRow.appendChild(cacheInput);
+    cacheRow.appendChild(clearCacheBtn);
+    cacheRow.appendChild(cacheStatus);
+    body.appendChild(cacheRow);
 
     // ---- Player avatar ----
     body.appendChild(this.sectionLabel('Player avatar'));

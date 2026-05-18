@@ -316,6 +316,7 @@ function renderRuleRow(r: RuleRow, opts: SectionOpts): HTMLDivElement {
       row.style.opacity = '0.4';
       row.style.pointerEvents = 'none';
       setTimeout(() => row.remove(), 300);
+      try { document.dispatchEvent(new CustomEvent('rules:updated')); } catch {}
     } catch (err) {
       console.error('[rules] delete failed:', { ruleId: r.id, rawId: r.rawId, account: r.account, error: err });
       const msg = err instanceof Error ? err.message : String(err);
@@ -678,6 +679,10 @@ export function openRuleEditor(opts: {
       }
       overlay.remove();
       opts.onSaved();
+      // Notify scene-wide listeners (e.g. the Move-to suggestion
+      // engine's rules cache) so a freshly-created rule is reflected
+      // in the next picker the user opens.
+      try { document.dispatchEvent(new CustomEvent('rules:updated')); } catch {}
     } catch (err) {
       console.error('[rules] save failed:', err);
       const msg = err instanceof Error ? err.message : String(err);

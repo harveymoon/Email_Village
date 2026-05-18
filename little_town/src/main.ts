@@ -476,6 +476,12 @@ class VillageScene extends Phaser.Scene {
           console.warn(`[avatar:updated] npc refresh failed for ${email}`, err));
       }
     });
+    // Rules pane / editor dispatches this after a create or delete —
+    // refresh our cache so the Move-to suggestion engine sees the new
+    // (or deleted) rule on the very next picker open.
+    document.addEventListener('rules:updated', () => {
+      this.loadRulesCache(true).catch(() => { /* logged inside */ });
+    });
 
     const raw = this.cache.json.get('mapdata');
     raw.tilesets = raw.tilesets.filter((t: any) => typeof t.image === 'string' && t.image.length > 0);
@@ -1125,6 +1131,10 @@ class VillageScene extends Phaser.Scene {
           // without making the user click Refresh or "Scan all".
           .then(() => this.precacheAllLabels())
           .catch(err => console.warn('[npc-spawn] failed', err));
+        // Independent kick-off: load the user's Gmail filters so the
+        // Move-to suggestion engine can surface "this rule would
+        // catch this email" picks at the top of the destinations list.
+        this.loadRulesCache().catch(() => { /* logged inside */ });
       } else {
         this.openSignInModal();
       }
@@ -2700,6 +2710,63 @@ class VillageScene extends Phaser.Scene {
   // suggestion per label wins. Caller (destinationsForMove) uses these
   // to flag destinations whose bound labels match — those float to the
   // top of every Move-to picker with a green highlight + a caption.
+  // Session-scoped cache of Gmail filters used by suggestion-engine
+  // and the Rules pane. Loaded once on auth bootstrap and refreshed
+  // whenever a rule is created/deleted via the in-app editor so the
+  // suggestion engine reflects new rules immediately.
+  private rulesCache: any[] | null = null;
+  private rulesCacheInFlight: Promise<any[]> | null = null;
+  loadRulesCache(force = false): Promise<any[]> {
+    if (!force && this.rulesCache) return Promise.resolve(this.rulesCache);
+    if (this.rulesCacheInFlight) return this.rulesCacheInFlight;
+    this.rulesCacheInFlight = api.filters().then(rules => {
+      this.rulesCache = rules as any[];
+      this.rulesCacheInFlight = null;
+      return this.rulesCache;
+    }).catch(err => {
+      this.rulesCacheInFlight = null;
+      console.warn('[rules-cache] fetch failed:', err);
+      return [];
+    });
+    return this.rulesCacheInFlight;
+  }
+
+  // Walk cached rules and return any whose `from` criterion matches
+  // the given sender. Each match is mapped to the label name it would
+  // apply (first non-system add label). Returns label names only —
+  // caller wraps them as suggestions with the right confidence.
+  private rulesMatchingSender(senderEmail: string): Array<{ labelName: string; account: string }> {
+    const rules = this.rulesCache;
+    if (!rules) return [];
+    const labels = this.labelCache || [];
+    const senderLower = senderEmail.toLowerCase();
+    const SYSTEM = new Set(['INBOX', 'SENT', 'DRAFT', 'SPAM', 'TRASH', 'UNREAD', 'STARRED', 'IMPORTANT']);
+    const out: Array<{ labelName: string; account: string }> = [];
+    for (const r of rules) {
+      if (r.error) continue;
+      const from = (r.criteria?.from || '').toLowerCase().trim();
+      if (!from) continue;
+      const tokens = from.split(/[\s,]+|\bor\b/i).map((s: string) => s.trim()).filter(Boolean);
+      const senderMatches = tokens.some((tok: string) => {
+        if (tok === senderLower) return true;
+        if (tok.startsWith('@')) return senderLower.endsWith(tok);
+        if (!tok.includes('@') && tok.includes('.')) {
+          return senderLower.endsWith('@' + tok) || senderLower.endsWith('.' + tok);
+        }
+        return false;
+      });
+      if (!senderMatches) continue;
+      // Resolve the rule's add-label id → label name in the rule's account.
+      const adds: string[] = r.action?.addLabelIds || [];
+      for (const rawId of adds) {
+        if (SYSTEM.has(rawId)) continue;     // skip STARRED/IMPORTANT etc.
+        const found = labels.find(l => l.account === r.account && l.rawId === rawId);
+        if (found) out.push({ labelName: found.name, account: r.account });
+      }
+    }
+    return out;
+  }
+
   private computeMoveSuggestions(thread: EmailThread): Array<{ labelName: string; confidence: number; reason: string }> {
     const senderEmail = thread.from?.email?.toLowerCase();
     if (!senderEmail) return [];
@@ -2727,9 +2794,35 @@ class VillageScene extends Phaser.Scene {
     }
 
     const out: Array<{ labelName: string; confidence: number; reason: string }> = [];
-    // Same-sender history dominates.
+    // (0) Existing Gmail filter match — top priority. If the user
+    // already created a rule that would label this email, suggest
+    // its destination first. Rules made AFTER an email arrived don't
+    // back-apply to that email; this surface lets the user finish
+    // the job with one click. Confidence 1.0 so rule matches always
+    // sort above any history-based signal.
+    if (this.rulesCache) {
+      const ruleMatches = this.rulesMatchingSender(senderEmail);
+      const seenLabels = new Set<string>();
+      for (const m of ruleMatches) {
+        if (seenLabels.has(m.labelName)) continue;
+        seenLabels.add(m.labelName);
+        out.push({
+          labelName: m.labelName,
+          confidence: 1.0,
+          reason: `Matches your rule on ${m.account}`,
+        });
+      }
+    } else {
+      // First time a suggestion is requested — kick off a background
+      // fetch so the NEXT picker (this session) gets rule matches.
+      this.loadRulesCache();
+    }
+    // Same-sender history dominates among non-rule signals.
     for (const [labelName, count] of senderLabelCounts) {
       if (count < 2) continue;
+      // Skip if a rule already covers this label — keep the higher-
+      // confidence rule suggestion and don't duplicate.
+      if (out.find(s => s.labelName === labelName)) continue;
       out.push({
         labelName,
         confidence: Math.min(0.95, 0.7 + count * 0.04),
@@ -2740,6 +2833,7 @@ class VillageScene extends Phaser.Scene {
     for (const [labelName, count] of domainLabelCounts) {
       if (count < 2) continue;
       if (senderLabelCounts.has(labelName)) continue;
+      if (out.find(s => s.labelName === labelName)) continue;
       out.push({
         labelName,
         confidence: Math.min(0.85, 0.55 + count * 0.03),

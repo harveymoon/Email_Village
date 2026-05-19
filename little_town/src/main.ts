@@ -2550,23 +2550,38 @@ class VillageScene extends Phaser.Scene {
 
   // Companion picker for the "Move all" button — calls moveAllForNpc
   // with the selected destination instead of per-thread moveThread.
-  private openNpcMoveAllMenu(npc: NPC, anchor: HTMLElement): void {
+  private async openNpcMoveAllMenu(npc: NPC, anchor: HTMLElement): Promise<void> {
     document.querySelectorAll('[data-npc-move]').forEach(el => el.remove());
+    if (!this.rulesCache) {
+      try { await this.loadRulesCache(); } catch { /* logged inside */ }
+    }
     const rect = anchor.getBoundingClientRect();
     // Move-all needs destinations whose labels cover EVERY account
     // represented by this NPC's threads (otherwise some threads would
     // get orphaned). Derive unique accounts from the thread ids.
     const tids: string[] = (npc.data as any)?.threadIds || [];
     const accounts = [...new Set(tids.map(id => id.split(':')[0]))];
-    // ALL threads on a single NPC come from the same sender (the spawn
-    // groups by sender per building), so we can use ANY of the NPC's
-    // threads as the "representative" for suggestion lookup. Without
-    // this the move-all picker would have no `forThread` and skip
-    // rule / sender-history / domain suggestions entirely.
+    // ALL threads on a single NPC come from the same sender (spawn
+    // groups by sender per building), so any cached thread is a valid
+    // representative for suggestion lookup. Fall back to constructing
+    // a stub from NPC data if the persistent cache evicted the real
+    // thread (suggestions only need from.email + threadId).
     let repThread: EmailThread | undefined;
     for (const tid of tids) {
       const t = this.findCachedThread(tid);
       if (t) { repThread = t; break; }
+    }
+    if (!repThread && tids.length) {
+      const data = (npc.data || {}) as any;
+      if (data.fromEmail) {
+        repThread = {
+          threadId: tids[0],
+          account: tids[0].split(':')[0],
+          from: { email: data.fromEmail, name: data.fromName || '', avatar: null },
+          labels: [],
+          messages: [],
+        } as unknown as EmailThread;
+      }
     }
     const destinations = this.destinationsForMove(accounts, repThread);
     const pop = document.createElement('div');
@@ -2630,12 +2645,39 @@ class VillageScene extends Phaser.Scene {
 
   // Companion to openNpcActionMenu: pops a searchable destinations
   // picker right next to the "Move to…" button.
-  private openNpcMoveMenu(threadId: string, anchor: HTMLElement): void {
+  private async openNpcMoveMenu(threadId: string, anchor: HTMLElement): Promise<void> {
     document.querySelectorAll('[data-npc-move]').forEach(el => el.remove());
+    // Ensure rules cache is hydrated BEFORE we compute suggestions so
+    // the rule-match signal can promote its destination to the top.
+    // Cache hit on every call after bootstrap → no perceptible delay.
+    if (!this.rulesCache) {
+      try { await this.loadRulesCache(); } catch { /* logged inside */ }
+    }
     const rect = anchor.getBoundingClientRect();
     // Per-thread filter: only show buildings whose labels exist in
     // this thread's account.
-    const destinations = this.destinationsForMove(threadId.split(':')[0], this.findCachedThread(threadId) || undefined);
+    // Suggestions need a thread object to know the sender — fall back
+    // to constructing a minimal stub from the owning NPC's data when
+    // the persistent cache evicted the real thread. computeMoveSuggestions
+    // only reads from.email + threadId, so the stub is sufficient.
+    let forThread: EmailThread | undefined = this.findCachedThread(threadId) || undefined;
+    if (!forThread) {
+      const npc = this.npcs.find(n => {
+        const tids = (n.data as any)?.threadIds as string[] | undefined;
+        return Array.isArray(tids) && tids.includes(threadId);
+      });
+      const data = (npc?.data || {}) as any;
+      if (data.fromEmail) {
+        forThread = {
+          threadId,
+          account: threadId.split(':')[0],
+          from: { email: data.fromEmail, name: data.fromName || '', avatar: null },
+          labels: [],
+          messages: [],
+        } as unknown as EmailThread;
+      }
+    }
+    const destinations = this.destinationsForMove(threadId.split(':')[0], forThread);
     const pop = document.createElement('div');
     pop.setAttribute('data-npc-move', '1');
     pop.style.cssText = `

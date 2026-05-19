@@ -75,13 +75,22 @@ export function loadAvatar(email: string): AvatarConfig | null {
   return loadAll()[email.toLowerCase()] || null;
 }
 export function saveAvatar(email: string, cfg: AvatarConfig): void {
+  const key = email.toLowerCase();
   const all = loadAll();
-  all[email.toLowerCase()] = cfg;
+  // Skip the write + the event dispatch entirely if the config didn't
+  // actually change. Without this guard a buggy patch path that saves
+  // an unchanged config can trigger a save → avatar:updated →
+  // refreshNpcsForEmail → ensureAvatar → save loop that locks the
+  // browser tab. Compare key-by-key so undefined fields don't differ
+  // from absent ones across JSON roundtrips.
+  const prev = all[key];
+  const KEYS: Array<keyof AvatarConfig> = ['body', 'eyes', 'outfit', 'hairstyle', 'accessory'];
+  const same = prev && KEYS.every(k => (prev as any)[k] === (cfg as any)[k]);
+  if (same) return;
+  all[key] = cfg;
   saveAll(all);
-  // Notify anyone watching (the game scene swaps NPC / player textures
-  // when this fires; open portrait popups can refresh their previews).
   try {
-    document.dispatchEvent(new CustomEvent('avatar:updated', { detail: { email: email.toLowerCase() } }));
+    document.dispatchEvent(new CustomEvent('avatar:updated', { detail: { email: key } }));
   } catch { /* non-DOM env (tests etc.) — ignore */ }
 }
 
@@ -169,21 +178,42 @@ export async function ensureAvatar(email: string): Promise<AvatarConfig> {
         delete (existing as any)[k];
       }
     }
-    // Patch any required layer that's missing (body/eyes/outfit/
-    // hairstyle). Pre-existing configs from earlier generation logic
-    // may be missing these. We DON'T touch accessory — that's optional
-    // and the user may have intentionally cleared it. Use a salt
-    // suffix on the seed so the patched picks are deterministic but
-    // don't change unrelated layers.
-    const patches: Partial<AvatarConfig> = {};
-    const REQUIRED: Array<keyof AvatarConfig> = ['body', 'eyes', 'outfit', 'hairstyle'];
-    const missing = REQUIRED.filter(k => !existing[k]);
-    if (missing.length) {
+    // Patch any STRICTLY-required layer that's missing (body/eyes/
+    // outfit). Hairstyle is "encouraged but optional" — 85% of new
+    // avatars get hair via randomAvatar, the rest are baldies on
+    // purpose. Accessory is fully optional and we never overwrite it.
+    //
+    // CRITICAL: only save+dispatch if we actually filled something.
+    // randomAvatar's probabilistic layers (hairstyle, accessory) can
+    // return undefined; without this guard we'd save an unchanged
+    // config, fire `avatar:updated`, the scene listener would call
+    // refreshNpcsForEmail → ensureAvatar → here again with the same
+    // deterministic seed → same empty roll → infinite save/dispatch
+    // loop. (Seen as the "swapped N NPC texture(s)" log spam.)
+    const STRICT: Array<keyof AvatarConfig> = ['body', 'eyes', 'outfit'];
+    const missingStrict = STRICT.filter(k => !existing[k]);
+    const needsHairRoll = !existing.hairstyle;
+    if (missingStrict.length || needsHairRoll) {
       const random = await randomAvatar(email + ':patch');
-      for (const k of missing) (patches as any)[k] = random[k];
-      const next = { ...existing, ...patches } as AvatarConfig;
-      saveAvatar(email, next);
-      return next;
+      let dirty = false;
+      const patches: Partial<AvatarConfig> = {};
+      for (const k of missingStrict) {
+        if (random[k]) { (patches as any)[k] = random[k]; dirty = true; }
+      }
+      // Hair: if the random roll produced one, fill it in; otherwise
+      // leave the field missing (the avatar stays bald) and DO NOT
+      // re-save — re-saving would loop forever on the same seed.
+      if (needsHairRoll && random.hairstyle) {
+        patches.hairstyle = random.hairstyle;
+        dirty = true;
+      }
+      if (dirty) {
+        const next = { ...existing, ...patches } as AvatarConfig;
+        saveAvatar(email, next);
+        return next;
+      }
+      // Nothing to patch — return existing as-is. No event dispatched.
+      return existing;
     }
     return existing;
   }

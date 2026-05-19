@@ -39,7 +39,26 @@ export interface EmailMessage {
   isRead: boolean;
   isStarred: boolean;
   hasAttachment: boolean;
-  unsubscribeUrl?: string | null;
+  // Populated by backend from List-Unsubscribe / List-Unsubscribe-Post
+  // headers (or a body-scan fallback). Triggers the Unsubscribe button
+  // in the email popup. The actual action is performed server-side via
+  // POST /threads/:tid/messages/:mid/unsubscribe; the client only
+  // checks for presence to decide whether to show the button.
+  unsubscribe?: {
+    http?: string;
+    mailto?: string;
+    oneClick: boolean;
+    source: 'header' | 'body';
+  } | null;
+}
+
+export interface UnsubscribeResult {
+  method: 'oneclick' | 'mailto' | 'open' | 'none';
+  ok: boolean;
+  url?: string;
+  status?: number;
+  sentId?: string;
+  error?: string;
 }
 
 export interface EmailThread {
@@ -136,6 +155,10 @@ export const api = {
                  request<{ success: boolean; account: string; id: string; threadId: string }>(`/api/threads/${encodeURIComponent(prefixedThreadId)}/reply`, {
                    method: 'POST',
                    body: JSON.stringify({ body, to }),
+                 }),
+  unsubscribe: (prefixedThreadId: string, prefixedMsgId: string) =>
+                 request<UnsubscribeResult>(`/api/threads/${encodeURIComponent(prefixedThreadId)}/messages/${encodeURIComponent(prefixedMsgId)}/unsubscribe`, {
+                   method: 'POST',
                  }),
   disconnect:  (email: string) => request<{ success: boolean; remaining: string[] }>(`/auth/disconnect/${encodeURIComponent(email)}`, { method: 'POST' }),
   signInUrl:   (addAccount = false) =>

@@ -197,6 +197,10 @@ function messageCard(m: EmailMessage, onOpenProfile?: (email: string) => void): 
   date.textContent = m.date;
   date.style.cssText = 'color:#777; font:12px ui-monospace,Consolas,monospace; flex:0 0 auto;';
   hdr.appendChild(from);
+  // Unsubscribe pill — only shown when the message exposes the
+  // List-Unsubscribe header or an inline body link. Action is
+  // server-side: one-click POST → mailto-send → open-in-tab fallback.
+  if (m.unsubscribe) hdr.appendChild(unsubscribeButton(m));
   hdr.appendChild(date);
 
   // Body — sanitised HTML if present, else plain text. Remote images
@@ -226,6 +230,63 @@ function messageCard(m: EmailMessage, onOpenProfile?: (email: string) => void): 
   card.appendChild(avatar);
   card.appendChild(main);
   return card;
+}
+
+// Unsubscribe pill rendered in a message's header. Inline so we can
+// keep the rest of the messageCard layout intact. Disables itself while
+// the request is in flight; on success swaps to a ✓ Unsubscribed state.
+// For 'open' results we open the URL in a new tab — many list managers
+// require a final confirmation click that can't be automated server-
+// side.
+function unsubscribeButton(m: EmailMessage): HTMLButtonElement {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.textContent = m.unsubscribe?.oneClick ? 'Unsubscribe' : 'Unsubscribe…';
+  btn.title = m.unsubscribe?.source === 'body'
+    ? 'Found an unsubscribe link in the message body. Opens the page in a new tab.'
+    : m.unsubscribe?.oneClick
+      ? 'One-click unsubscribe (RFC 8058) — processed automatically.'
+      : m.unsubscribe?.mailto
+        ? `Sends an unsubscribe email to ${m.unsubscribe.mailto}`
+        : 'Opens the unsubscribe page in a new tab.';
+  btn.style.cssText = `
+    background:#3a2050; color:#d8b8ff; border:1px solid #5a3580;
+    border-radius:14px; padding:3px 12px; cursor:pointer; flex:0 0 auto;
+    font:600 11px ui-sans-serif,system-ui,sans-serif;
+  `;
+  btn.addEventListener('mouseenter', () => { btn.style.background = '#4a2a64'; });
+  btn.addEventListener('mouseleave', () => { btn.style.background = '#3a2050'; });
+  btn.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    if (btn.disabled) return;
+    const orig = btn.textContent;
+    btn.disabled = true;
+    btn.style.opacity = '0.65';
+    btn.textContent = 'Unsubscribing…';
+    try {
+      const result = await api.unsubscribe(m.threadId, m.id);
+      if (result.method === 'open' && result.url) {
+        window.open(result.url, '_blank', 'noopener,noreferrer');
+        btn.textContent = '↗ Opened';
+        btn.title = `Opened ${result.url} in a new tab. Complete the form there to finish.`;
+      } else if (result.method === 'oneclick' && result.ok) {
+        btn.textContent = '✓ Unsubscribed';
+        btn.title = `One-click unsubscribe sent (HTTP ${result.status}).`;
+      } else if (result.method === 'mailto' && result.ok) {
+        btn.textContent = '✓ Email sent';
+        btn.title = `Unsubscribe email sent to the list address.`;
+      } else {
+        btn.textContent = '⚠ Failed';
+        btn.title = result.error || `Method ${result.method} returned status ${result.status ?? '?'}.`;
+        btn.disabled = false; btn.style.opacity = '1';
+      }
+    } catch (err) {
+      btn.textContent = orig || 'Unsubscribe';
+      btn.disabled = false; btn.style.opacity = '1';
+      alert(`Unsubscribe failed: ${err}`);
+    }
+  });
+  return btn;
 }
 
 function buildReplyFooter(t: EmailThread): HTMLDivElement {

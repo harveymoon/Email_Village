@@ -125,7 +125,49 @@ function parseMessage(account, message) {
     isRead: !message.labelIds?.includes('UNREAD'),
     isStarred: message.labelIds?.includes('STARRED'),
     hasAttachment,
+    unsubscribe: extractUnsubscribe(getHeader('List-Unsubscribe'), getHeader('List-Unsubscribe-Post'), bodyHtml),
   };
+}
+
+// Pull unsubscribe metadata out of the RFC 2369 List-Unsubscribe +
+// RFC 8058 List-Unsubscribe-Post headers, with a body-scan fallback
+// for senders that only embed an unsubscribe link in the HTML footer.
+//
+// Returns null when nothing is found. Otherwise:
+//   { http?: string,    // first https/http URL we saw
+//     mailto?: string,  // first mailto: address we saw
+//     oneClick: boolean,// RFC 8058 — server may POST to http with no UI
+//     source: 'header' | 'body' }
+//
+// The frontend renders an "Unsubscribe" button whenever this is non-
+// null; the backend /unsubscribe endpoint decides what to actually do
+// (POST for one-click, send mailto, or hand the URL back so the
+// browser can open it in a new tab).
+function extractUnsubscribe(listHeader, postHeader, html) {
+  const out = { oneClick: false, source: 'header' };
+  if (listHeader) {
+    // Header looks like `<mailto:foo@bar>, <https://baz/quux>` —
+    // multiple `<...>` values separated by commas. Pick the first
+    // mailto and the first http(s) we see.
+    const matches = listHeader.match(/<([^>]+)>/g) || [];
+    for (const raw of matches) {
+      const v = raw.slice(1, -1).trim();
+      if (!out.mailto && v.toLowerCase().startsWith('mailto:')) out.mailto = v.slice(7);
+      else if (!out.http && /^https?:/i.test(v)) out.http = v;
+    }
+    if (postHeader && /one-click/i.test(postHeader)) out.oneClick = true;
+    if (out.mailto || out.http) return out;
+  }
+  // Fallback: scrape the HTML body for an unsubscribe-looking link.
+  // Cheap regex — we accept some false positives because the worst case
+  // is a button that opens a wrong page in a new tab.
+  if (html) {
+    const m = html.match(/href\s*=\s*["']([^"']*unsubscrib[^"']*)["']/i);
+    if (m && /^https?:/i.test(m[1])) {
+      return { http: m[1], oneClick: false, source: 'body' };
+    }
+  }
+  return null;
 }
 
 // ---------------- profile (multi) ----------------
@@ -455,6 +497,100 @@ router.post('/threads/:id/reply', requireAuth, async (req, res) => {
     });
   } catch (err) {
     handleGmailError(err, res, 'send reply', account);
+  }
+});
+
+// ---------------- unsubscribe ----------------
+// POST /threads/:threadId/messages/:msgId/unsubscribe
+//
+// Reads the message's List-Unsubscribe / List-Unsubscribe-Post headers
+// (re-fetching server-side so the client doesn't need to send anything
+// sensitive) and performs the best available action:
+//
+//   1. RFC 8058 one-click (List-Unsubscribe-Post: List-Unsubscribe=One-Click)
+//      → backend POSTs the form body to the http URL. No user interaction.
+//   2. mailto: → backend sends an empty Gmail message to that address.
+//   3. http(s) only → backend returns the URL and `{ method: 'open' }`
+//      so the frontend can open it in a new tab.
+//
+// Response shape: { method, ok, url?, status?, body? }
+//   - method: 'oneclick' | 'mailto' | 'open' | 'none'
+//   - ok: true if action completed (or open URL returned)
+//   - status/body: HTTP details when method=='oneclick' for debugging
+router.post('/threads/:threadId/messages/:msgId/unsubscribe', requireAuth, async (req, res) => {
+  const { account, id: threadId } = parseId(req.params.threadId);
+  const { id: msgId } = parseId(req.params.msgId);
+  if (!account) return res.status(400).json({ error: 'threadId must be prefixed with account:' });
+  const client = req.oauth2Clients[account];
+  if (!client) return res.status(401).json({ error: `account not active: ${account}` });
+  try {
+    const gmail = getGmailClient(client);
+    // Pull just the relevant headers — full body is fetched again
+    // below only if we need the html-body fallback.
+    const headResp = await gmail.users.messages.get({
+      userId: 'me', id: msgId, format: 'metadata',
+      metadataHeaders: ['List-Unsubscribe', 'List-Unsubscribe-Post'],
+    });
+    const headers = headResp.data.payload?.headers || [];
+    const h = (n) => headers.find(x => x.name.toLowerCase() === n.toLowerCase())?.value || '';
+    let info = extractUnsubscribe(h('List-Unsubscribe'), h('List-Unsubscribe-Post'), null);
+    if (!info) {
+      // Fall back to full-body scrape — slower but salvages many
+      // newsletters that don't bother with the proper header.
+      const full = await gmail.users.messages.get({ userId: 'me', id: msgId, format: 'full' });
+      const parsed = parseMessage(account, full.data);
+      info = parsed.unsubscribe;
+    }
+    if (!info) return res.status(404).json({ method: 'none', ok: false, error: 'no unsubscribe info found' });
+
+    // 1. RFC 8058 one-click
+    if (info.oneClick && info.http) {
+      const r = await fetch(info.http, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: 'List-Unsubscribe=One-Click',
+      });
+      const text = await r.text().catch(() => '');
+      return res.json({
+        method: 'oneclick', ok: r.ok,
+        status: r.status,
+        body: text.slice(0, 500),
+        url: info.http,
+      });
+    }
+
+    // 2. mailto:
+    if (info.mailto) {
+      const profile = await gmail.users.getProfile({ userId: 'me' });
+      const fromAddr = profile.data.emailAddress;
+      // Per RFC 2369: subject + body are sender-defined. "unsubscribe"
+      // is the de facto convention and many list managers parse it.
+      const rfc = [
+        `To: ${info.mailto}`,
+        `From: ${fromAddr}`,
+        `Subject: unsubscribe`,
+        `Content-Type: text/plain; charset="UTF-8"`,
+        `MIME-Version: 1.0`,
+        '',
+        'unsubscribe',
+      ].join('\r\n');
+      const raw = Buffer.from(rfc, 'utf-8').toString('base64')
+        .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+      const sendResp = await gmail.users.messages.send({ userId: 'me', requestBody: { raw } });
+      return res.json({
+        method: 'mailto', ok: true,
+        url: `mailto:${info.mailto}`,
+        sentId: `${account}:${sendResp.data.id}`,
+      });
+    }
+
+    // 3. open-in-browser only
+    if (info.http) {
+      return res.json({ method: 'open', ok: true, url: info.http });
+    }
+    return res.status(404).json({ method: 'none', ok: false, error: 'unsubscribe info had no actionable url' });
+  } catch (err) {
+    handleGmailError(err, res, 'unsubscribe', account);
   }
 });
 

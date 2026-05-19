@@ -6,7 +6,8 @@
 import { CHARACTERS } from './characters';
 import type { Person, PersonOverride, ContactField } from './people';
 import type { EmailThread } from './api';
-import { renderEmailListInto } from './email_ui';
+import { renderEmailListInto, destinationMatches, matchedFloor, applySuggestionStyle } from './email_ui';
+import { clampPopupToViewport } from './ui_helpers';
 import { avatarPortraitForEmail, loadAvatar, saveAvatar, type AvatarConfig } from './avatar';
 import { mountCharacterBuilder } from './character_builder_app.js';
 import { renderSenderRulesPanel } from './rules_ui';
@@ -239,6 +240,14 @@ export interface OpenPersonPopupOptions {
   // pre-filled with from:<this person's email>).
   accounts?: AccountSummary[];
   labels?: GmailLabel[] | null;
+  // Per-thread building lookup. When provided, each Conversations row
+  // shows which building(s) the thread currently lives in.
+  buildingsForThread?: (t: EmailThread) => string[];
+  // Destination set + "Move all" handler. When BOTH are provided, the
+  // Conversations section header gets a "Move all →" button that picks
+  // ONE destination and applies it to every thread on this profile.
+  destinationsForPerson?: (threads: EmailThread[]) => Array<{ labelId: string; label: string; buildingName: string; floors?: string[]; suggestion?: { confidence: number; reason: string; label?: string } }>;
+  onMoveAll?: (threads: EmailThread[], destLabelId: string, destBuildingName: string, overrideLabel?: string) => Promise<void>;
 }
 
 export function openPersonPopup(opts: OpenPersonPopupOptions): void {
@@ -384,7 +393,35 @@ export function openPersonPopup(opts: OpenPersonPopupOptions): void {
   notes.addEventListener('input', () => { working.notes = notes.value; commit(); });
   rightCol.appendChild(notes);
 
-  rightCol.appendChild(sectionHeading(`Conversations (${opts.allThreads.length})`));
+  // Conversations heading + (optional) "Move all →" button. Button is
+  // only shown when the caller wired both the destination lookup and
+  // the bulk-move handler — without them we don't know what choices to
+  // offer or how to apply them.
+  const convHeader = document.createElement('div');
+  convHeader.style.cssText = 'display:flex; align-items:center; gap:10px; border-bottom:1px solid #222; padding-bottom:6px;';
+  const convTitle = document.createElement('div');
+  convTitle.textContent = `Conversations (${opts.allThreads.length})`;
+  convTitle.style.cssText = 'color:#aaa; font-size:13px; text-transform:uppercase; letter-spacing:0.06em; flex:1 1 auto;';
+  convHeader.appendChild(convTitle);
+  if (opts.allThreads.length && opts.destinationsForPerson && opts.onMoveAll) {
+    const moveAllBtn = document.createElement('button');
+    moveAllBtn.type = 'button';
+    moveAllBtn.textContent = `Move all ${opts.allThreads.length} →`;
+    moveAllBtn.title = `File every conversation from ${opts.person.name || opts.person.email} into one building`;
+    moveAllBtn.style.cssText = `
+      background:#3a2050; color:#d8b8ff; border:1px solid #5a3580; border-radius:14px;
+      padding:4px 12px; cursor:pointer; flex:0 0 auto;
+      font:600 12px ui-sans-serif,system-ui,sans-serif;
+    `;
+    moveAllBtn.addEventListener('mouseenter', () => { moveAllBtn.style.background = '#4a2a64'; });
+    moveAllBtn.addEventListener('mouseleave', () => { moveAllBtn.style.background = '#3a2050'; });
+    moveAllBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openPersonMoveAllPicker(moveAllBtn, opts);
+    });
+    convHeader.appendChild(moveAllBtn);
+  }
+  rightCol.appendChild(convHeader);
   const threadsBox = document.createElement('div');
   threadsBox.style.cssText = 'display:flex; flex-direction:column; gap:8px;';
   if (!opts.allThreads.length) {
@@ -396,6 +433,7 @@ export function openPersonPopup(opts: OpenPersonPopupOptions): void {
     renderEmailListInto(threadsBox, {
       threads: opts.allThreads,
       onSelect: (t) => { closePersonPopup(); opts.onOpenEmail(t); },
+      buildingsForThread: opts.buildingsForThread,
     });
   }
   rightCol.appendChild(threadsBox);
@@ -415,6 +453,82 @@ export function closePersonPopup(): void {
   if (!personEl) return;
   personEl.remove(); personEl = null;
   if (personEsc) { document.removeEventListener('keydown', personEsc); personEsc = null; }
+}
+
+// Move-all picker for a person profile. Same UX as the per-row Move-to
+// dropdown but the chosen destination is applied to EVERY thread on
+// the profile. Useful when a newsletter sender has threads scattered
+// across multiple buildings and you want to consolidate them all.
+function openPersonMoveAllPicker(anchor: HTMLElement, opts: OpenPersonPopupOptions): void {
+  if (!opts.destinationsForPerson || !opts.onMoveAll) return;
+  document.querySelectorAll('[data-person-moveall]').forEach(el => el.remove());
+  const destinations = opts.destinationsForPerson(opts.allThreads);
+  const rect = anchor.getBoundingClientRect();
+  const pop = document.createElement('div');
+  pop.setAttribute('data-person-moveall', '1');
+  pop.style.cssText = `
+    position:fixed; top:${rect.bottom + 6}px;
+    left:${Math.max(8, Math.min(rect.right - 360, window.innerWidth - 380))}px;
+    z-index:1300; width:360px; max-height:60vh; overflow:hidden;
+    background:#181818; color:#eee; border:1px solid #333; border-radius:8px;
+    box-shadow:0 16px 40px rgba(0,0,0,0.7); padding:8px;
+    display:flex; flex-direction:column; gap:6px;
+  `;
+  const header = document.createElement('div');
+  header.textContent = `Move ${opts.allThreads.length} thread${opts.allThreads.length === 1 ? '' : 's'} to…`;
+  header.style.cssText = 'color:#d8b8ff; font:600 12px ui-sans-serif,system-ui,sans-serif; padding:4px 6px;';
+  const search = document.createElement('input');
+  search.placeholder = 'Search buildings / labels…';
+  search.style.cssText = 'background:#0b0b0b; color:#eee; border:1px solid #333; border-radius:4px; padding:6px 10px; font:13px ui-sans-serif,system-ui,sans-serif;';
+  const list = document.createElement('div');
+  list.style.cssText = 'display:flex; flex-direction:column; gap:2px; overflow:auto;';
+  pop.appendChild(header); pop.appendChild(search); pop.appendChild(list);
+  pop.addEventListener('mousedown', (e) => e.stopPropagation());
+  document.body.appendChild(pop);
+  clampPopupToViewport(pop, { flipAboveAnchor: rect });
+
+  const render = () => {
+    list.innerHTML = '';
+    const q = search.value.trim().toLowerCase();
+    const filtered = destinations.filter(d => destinationMatches(d, q));
+    for (const d of filtered.slice(0, 200)) {
+      const r = document.createElement('div');
+      r.style.cssText = 'padding:8px 10px; cursor:pointer; border-radius:4px;';
+      const viaFloor = q ? matchedFloor(d, q) : null;
+      const sugg = applySuggestionStyle(r, d);
+      const suggFloor = (!viaFloor && sugg && sugg.label && sugg.label !== d.label) ? sugg.label : null;
+      const subText = viaFloor ? `via ${viaFloor}` : (suggFloor || d.label);
+      const subColor = viaFloor || suggFloor ? '#a8e6c0' : '#7a8b9f';
+      const suggLine = sugg
+        ? `<div style="color:#6ad26a; font:600 10px ui-monospace,Consolas,monospace;">✨ Suggested · ${escapeHtmlLocal(sugg.reason)}</div>`
+        : '';
+      r.innerHTML = `<div style="font:600 13px ui-sans-serif,system-ui,sans-serif; color:#fff;">${escapeHtmlLocal(d.buildingName)}</div>
+                     <div style="color:${subColor}; font:11px ui-monospace,Consolas,monospace;">${escapeHtmlLocal(subText)}</div>${suggLine}`;
+      r.addEventListener('mouseenter', () => r.style.background = sugg ? 'rgba(106, 210, 106, 0.15)' : '#22272e');
+      r.addEventListener('mouseleave', () => r.style.background = sugg ? 'rgba(106, 210, 106, 0.07)' : 'transparent');
+      r.addEventListener('click', async () => {
+        pop.remove();
+        try { await opts.onMoveAll!(opts.allThreads, d.labelId, d.buildingName, viaFloor || sugg?.label || undefined); }
+        catch (err) { alert(`Move all failed: ${err}`); }
+      });
+      list.appendChild(r);
+    }
+  };
+  search.addEventListener('input', render);
+  render();
+  setTimeout(() => {
+    search.focus();
+    const away = (e: MouseEvent) => {
+      if (pop.contains(e.target as Node)) return;
+      pop.remove();
+      document.removeEventListener('mousedown', away, true);
+    };
+    document.addEventListener('mousedown', away, true);
+  }, 0);
+}
+
+function escapeHtmlLocal(s: string): string {
+  return s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
 }
 
 // ---------- shared helpers ----------

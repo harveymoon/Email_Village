@@ -45,6 +45,11 @@ export interface RenderEmailListOptions {
   // sender (and account). Same UX path as the +Create rule button on
   // the NPC popup, just exposed inline in the inbox / building list.
   onMakeRule?: (t: EmailThread) => void;
+  // Optional per-thread building tag(s). Used in the person profile so
+  // each conversation row shows which building it's currently filed
+  // under (e.g. "Newsletters", "Post Office"). Resolution lives in the
+  // caller because it depends on the user's building→label bindings.
+  buildingsForThread?: (t: EmailThread) => string[];
 }
 
 export interface FloorOption {
@@ -139,10 +144,10 @@ export function renderEmailListInto(container: HTMLElement, opts: RenderEmailLis
     return new Date(b.date).getTime() - new Date(a.date).getTime();
   });
   if (opts.parentLabels && opts.parentLabels.length && opts.labels && opts.labels.length) {
-    renderWithFloors(container, sorted, opts.parentLabels, opts.labels, opts.onSelect, opts.destinationsFor, opts.onMove, opts.floorsFor, opts.onMoveToFloor, opts.onMakeRule);
+    renderWithFloors(container, sorted, opts.parentLabels, opts.labels, opts.onSelect, opts.destinationsFor, opts.onMove, opts.floorsFor, opts.onMoveToFloor, opts.onMakeRule, opts.buildingsForThread);
     return;
   }
-  for (const t of sorted) container.appendChild(makeRow(t, opts.onSelect, opts.destinationsFor, opts.onMove, opts.floorsFor, opts.onMoveToFloor, opts.onMakeRule));
+  for (const t of sorted) container.appendChild(makeRow(t, opts.onSelect, opts.destinationsFor, opts.onMove, opts.floorsFor, opts.onMoveToFloor, opts.onMakeRule, opts.buildingsForThread));
 }
 
 // Build (account, rawId) → name lookup, then for each thread find what
@@ -161,6 +166,7 @@ function renderWithFloors(
   floorsFor?: (t: EmailThread) => FloorOption[],
   onMoveToFloor?: (t: EmailThread, opt: FloorOption) => Promise<void>,
   onMakeRule?: (t: EmailThread) => void,
+  buildingsForThread?: (t: EmailThread) => string[],
 ): void {
   const nameByIdKey = new Map<string, string>();
   for (const l of labels) nameByIdKey.set(`${l.account}:${l.rawId}`, l.name);
@@ -211,7 +217,7 @@ function renderWithFloors(
     return a.label.localeCompare(b.label);
   });
   for (const g of entries) {
-    container.appendChild(makeFloor(g.label, g.threads, g.unread, onSelect, destinationsFor, onMove, floorsFor, onMoveToFloor, onMakeRule));
+    container.appendChild(makeFloor(g.label, g.threads, g.unread, onSelect, destinationsFor, onMove, floorsFor, onMoveToFloor, onMakeRule, buildingsForThread));
   }
 }
 
@@ -225,6 +231,7 @@ function makeFloor(
   floorsFor?: (t: EmailThread) => FloorOption[],
   onMoveToFloor?: (t: EmailThread, opt: FloorOption) => Promise<void>,
   onMakeRule?: (t: EmailThread) => void,
+  buildingsForThread?: (t: EmailThread) => string[],
 ): HTMLDetailsElement {
   const det = document.createElement('details');
   det.open = unread > 0;     // floors with unread default-open
@@ -259,7 +266,7 @@ function makeFloor(
   // everything else off-screen. Vertical scroll inside the floor when
   // the row count exceeds the cap.
   list.style.cssText = 'display:flex; flex-direction:column; gap:6px; padding:8px; max-height:50vh; overflow-y:auto;';
-  for (const t of threads) list.appendChild(makeRow(t, onSelect, destinationsFor, onMove, floorsFor, onMoveToFloor, onMakeRule));
+  for (const t of threads) list.appendChild(makeRow(t, onSelect, destinationsFor, onMove, floorsFor, onMoveToFloor, onMakeRule, buildingsForThread));
   det.appendChild(list);
   return det;
 }
@@ -352,6 +359,7 @@ function makeRow(
   floorsFor?: (t: EmailThread) => FloorOption[],
   onMoveToFloor?: (t: EmailThread, opt: FloorOption) => Promise<void>,
   onMakeRule?: (t: EmailThread) => void,
+  buildingsForThread?: (t: EmailThread) => string[],
 ): HTMLDivElement {
   // Evaluate destinations lazily for THIS thread so the per-thread
   // account filter takes effect.
@@ -394,7 +402,7 @@ function makeRow(
   row.appendChild(dateColumn(t));
   row.appendChild(avatarStack(t));
   row.appendChild(subjectAndSnippet(t));
-  row.appendChild(chipColumn(t));
+  row.appendChild(chipColumn(t, buildingsForThread ? buildingsForThread(t) : undefined));
   if (onMakeRule) {
     row.appendChild(makeRuleButton(t, onMakeRule));
   }
@@ -740,13 +748,36 @@ function accountPalette(account?: string) {
   return ACCOUNT_PALETTE[Math.abs(h) % ACCOUNT_PALETTE.length];
 }
 
-function chipColumn(t: EmailThread): HTMLDivElement {
+function chipColumn(t: EmailThread, buildings?: string[]): HTMLDivElement {
   const wrap = document.createElement('div');
   wrap.style.cssText = 'display:flex; flex-wrap:wrap; gap:6px; align-items:center; flex:0 0 auto; max-width:280px; justify-content:flex-end;';
 
-  // Account badge — first chip, always visible. Short-form: the localpart
-  // before the @, so harvey@spectra.studio reads as "harvey". Full
-  // address in the tooltip.
+  // Building chips first — most useful signal in the person profile
+  // ("which buildings does this thread live in?"). Amber palette so
+  // they stand apart from the blue domain chips and purple account
+  // chip. Hidden when caller didn't supply the lookup.
+  if (buildings && buildings.length) {
+    for (const name of buildings.slice(0, 3)) {
+      const chip = document.createElement('span');
+      chip.textContent = `🏠 ${name}`;
+      chip.title = `Currently filed in building: ${name}`;
+      chip.style.cssText = `
+        background:#3a2e15; color:#e0c080; border:1px solid #6a5020;
+        border-radius:10px; padding:2px 8px; font:600 11px ui-sans-serif,system-ui,sans-serif;
+      `;
+      wrap.appendChild(chip);
+    }
+    if (buildings.length > 3) {
+      const more = document.createElement('span');
+      more.textContent = `+${buildings.length - 3}`;
+      more.title = buildings.slice(3).join(', ');
+      more.style.cssText = 'background:#222; color:#aaa; border:1px solid #333; padding:2px 8px; border-radius:10px; font:11px ui-monospace,Consolas,monospace;';
+      wrap.appendChild(more);
+    }
+  }
+
+  // Account badge — short-form: the localpart before the @, so
+  // harvey@spectra.studio reads as "harvey". Full address in the tooltip.
   if (t.account) {
     const acctChip = document.createElement('span');
     const short = t.account.includes('@') ? t.account.split('@')[0] : t.account;

@@ -116,6 +116,7 @@ interface Building {
   x: number; y: number; w: number; h: number; // world-pixel rect
   state: Record<string, unknown>;             // arbitrary mutable game state
   label: Phaser.GameObjects.Text;             // floating name tag, updated on rename
+  badge?: Phaser.GameObjects.Text;            // separate red-circle unread-count badge, lazy-created
   region: string | null;                      // name of the Region object that contains this building, if any
 }
 
@@ -2217,6 +2218,17 @@ class VillageScene extends Phaser.Scene {
       onOpenEmail: (t) => this.openEmailFor(t),
       accounts: this.currentAccounts,
       labels: this.labelCache,
+      buildingsForThread: (t) => this.buildingsContainingThread(t),
+      destinationsForPerson: (threads) => {
+        const accounts = [...new Set(threads.map(tt => tt.account))];
+        return this.destinationsForMove(accounts, threads[0]);
+      },
+      onMoveAll: async (threads, destLabelId, destBuilding, overrideLabel) => {
+        for (const t of threads) {
+          try { await this.moveThread(t.threadId, destLabelId, destBuilding, overrideLabel); }
+          catch (err) { console.warn(`[moveAll-person] ${t.threadId}:`, err); }
+        }
+      },
     });
   }
 
@@ -2234,6 +2246,17 @@ class VillageScene extends Phaser.Scene {
           onOpenEmail: (t) => this.openEmailFor(t),
           accounts: this.currentAccounts,
           labels: this.labelCache,
+          buildingsForThread: (t) => this.buildingsContainingThread(t),
+          destinationsForPerson: (threads) => {
+            const accounts = [...new Set(threads.map(tt => tt.account))];
+            return this.destinationsForMove(accounts, threads[0]);
+          },
+          onMoveAll: async (threads, destLabelId, destBuilding, overrideLabel) => {
+            for (const t of threads) {
+              try { await this.moveThread(t.threadId, destLabelId, destBuilding, overrideLabel); }
+              catch (err) { console.warn(`[moveAll-person] ${t.threadId}:`, err); }
+            }
+          },
         });
       },
       onScanAll: async () => {
@@ -2895,6 +2918,33 @@ class VillageScene extends Phaser.Scene {
       // fetch so the NEXT picker (this session) gets rule matches.
       this.loadRulesCache();
     }
+    // Unsubscribe-link signal — if any message in this thread exposes
+    // the List-Unsubscribe header (or a body-link fallback), it's almost
+    // certainly a newsletter/promo. Boost every label bound to a
+    // Newsletters/* path or JUNK MAIL so the matching building floats
+    // toward the top. Confidence 0.92 sits below explicit rules (1.0)
+    // but above any sender-history signal. Stub threads from the NPC
+    // popup don't carry messages, so this only fires when we have the
+    // full thread cached — which is the common case.
+    const hasUnsubscribe = Array.isArray(thread.messages) && thread.messages.some(m => !!m?.unsubscribe);
+    if (hasUnsubscribe) {
+      const seenLabels = new Set(out.map(s => s.labelName));
+      for (const l of (this.labelCache || [])) {
+        if (seenLabels.has(l.name)) continue;
+        const lower = l.name.toLowerCase();
+        const isNewsletter = lower === 'newsletters' || lower.startsWith('newsletters/');
+        const isJunk = lower === 'junk mail' || lower === 'junk' || lower.startsWith('junk/');
+        if (!isNewsletter && !isJunk) continue;
+        out.push({
+          labelName: l.name,
+          confidence: 0.92,
+          reason: isJunk
+            ? 'Has unsubscribe link — likely junk'
+            : 'Has unsubscribe link — likely a newsletter',
+        });
+        seenLabels.add(l.name);
+      }
+    }
     // Same-sender history dominates among non-rule signals.
     for (const [labelName, count] of senderLabelCounts) {
       if (count < 2) continue;
@@ -2936,6 +2986,30 @@ class VillageScene extends Phaser.Scene {
       }
     }
     out.sort((a, b) => b.confidence - a.confidence);
+    return out;
+  }
+
+  // For a single thread, list the building NAMES it is currently filed
+  // under. A thread "lives in" a building when any of that building's
+  // bound labels appears on the thread (resolved from raw Gmail ids
+  // via the label cache, per the thread's owning account). INBOX maps
+  // to the Post Office because Post_Office is the conventional name
+  // for the INBOX-bound building. Used by the person profile to show
+  // a per-conversation badge.
+  private buildingsContainingThread(t: EmailThread): string[] {
+    const labels = this.labelCache || [];
+    const account = t.account;
+    const nameOnThread = new Set<string>();
+    for (const rawId of t.labels) {
+      if (rawId === 'INBOX') { nameOnThread.add('INBOX'); continue; }
+      const l = labels.find(ll => ll.account === account && ll.rawId === rawId);
+      if (l) nameOnThread.add(l.name);
+    }
+    const out: string[] = [];
+    for (const b of this.buildings) {
+      const bound = getBuildingLabels(b);
+      if (bound.some(n => nameOnThread.has(n))) out.push(b.name);
+    }
     return out;
   }
 
@@ -3541,14 +3615,41 @@ class VillageScene extends Phaser.Scene {
     return b;
   }
 
-  // Render a building's floating world-label as "<name>  ·  <unread>"
-  // when the building has any NPCs carrying unread threads, else just
-  // the name. Counts come from the live NPC list (homeBuildingId +
-  // threadIds.length) so the badge reflects exactly what's on the map
-  // — drops the moment an NPC walks off, climbs the moment they spawn.
+  // Render a building's floating world-label: the name itself stays
+  // clean ("Newsletters"), and the unread count rides on a separate
+  // red-circle badge anchored to the right edge of the name pill so
+  // the eye reads "count" not "name with arithmetic in it". Badge is
+  // lazily created the first time a building has an unread, then just
+  // shown/hidden + re-textured on subsequent calls.
+  //
+  // Counts come from the live NPC list (homeBuildingId + threadIds)
+  // — drops the moment an NPC walks off, climbs when they spawn.
   private renderBuildingLabel(b: Building): void {
+    b.label.setText(b.name);
     const c = this.unreadCountForBuilding(b);
-    b.label.setText(c > 0 ? `${b.name}  ·  ${c}` : b.name);
+    if (!b.badge) {
+      b.badge = this.add.text(0, 0, '', {
+        fontFamily: 'sans-serif',
+        fontSize: '28px',
+        fontStyle: 'bold',
+        color: '#fff',
+        backgroundColor: '#c8323c',
+        padding: { x: 10, y: 4 },
+        stroke: '#5a0d12',
+        strokeThickness: 3,
+      }).setOrigin(0.5, 0).setDepth(17).setVisible(false);
+    }
+    if (c <= 0) {
+      b.badge.setVisible(false);
+      return;
+    }
+    b.badge.setText(c > 99 ? '99+' : String(c));
+    b.badge.setVisible(true);
+    // Position the badge just to the right of the name pill, vertically
+    // centered against its top edge. label.width is recomputed after
+    // setText so this stays accurate as the name changes.
+    const rightEdge = b.label.x + b.label.displayWidth / 2;
+    b.badge.setPosition(rightEdge + 6 + b.badge.displayWidth / 2, b.label.y - 4);
   }
 
   private unreadCountForBuilding(b: Building): number {

@@ -2989,6 +2989,35 @@ class VillageScene extends Phaser.Scene {
     return out;
   }
 
+  // Walk every in-memory thread cache and patch the labels array on
+  // any thread whose threadId matches. Adds the new label's rawId
+  // (resolved from name + account via the label cache), removes any
+  // names in `removeNames` (also rawId-resolved). Same object refs as
+  // open popups hold, so their next render sees the new state.
+  private patchLocalThreadLabels(threadId: string, addName: string, removeNames: string[]): void {
+    const labels = this.labelCache || [];
+    const account = threadId.split(':')[0];
+    const addRaw = addName === 'INBOX'
+      ? 'INBOX'
+      : labels.find(l => l.account === account && l.name === addName)?.rawId;
+    const removeRawSet = new Set<string>(
+      removeNames.map(n => n === 'INBOX'
+        ? 'INBOX'
+        : labels.find(l => l.account === account && l.name === n)?.rawId)
+        .filter((v): v is string => !!v),
+    );
+    let patched = 0;
+    const apply = (t: EmailThread) => {
+      if (t.threadId !== threadId) return;
+      const before = t.labels.length;
+      t.labels = t.labels.filter(rid => !removeRawSet.has(rid));
+      if (addRaw && !t.labels.includes(addRaw)) t.labels.push(addRaw);
+      if (t.labels.length !== before || t.labels.includes(addRaw || '')) patched++;
+    };
+    for (const arr of this.emailCache.values()) for (const t of arr) apply(t);
+    if (patched > 0) console.log(`[move] patched labels on ${patched} cached thread copies`);
+  }
+
   // For a single thread, list the building NAMES it is currently filed
   // under. A thread "lives in" a building when any of that building's
   // bound labels appears on the thread (resolved from raw Gmail ids
@@ -3389,6 +3418,13 @@ class VillageScene extends Phaser.Scene {
 
     const modifyResult = await api.modify(threadId, [chosen], ['INBOX']);
     console.log(`[move] backend confirmed`, modifyResult);
+    // Patch any in-memory copies of this thread BEFORE blowing the
+    // cache away — open popups (e.g. the person profile) hold direct
+    // references to those thread objects and the next render needs to
+    // see the updated labels so its building chips refresh. Without
+    // this patch the chips stay frozen on the old building until the
+    // user closes & reopens the popup.
+    this.patchLocalThreadLabels(threadId, chosen, ['INBOX']);
     // Invalidate every cache touched: INBOX + the chosen label + every
     // other label this building binds (their thread counts might shift).
     this.emailCache.delete('INBOX');

@@ -424,19 +424,29 @@ export function openPersonPopup(opts: OpenPersonPopupOptions): void {
   rightCol.appendChild(convHeader);
   const threadsBox = document.createElement('div');
   threadsBox.style.cssText = 'display:flex; flex-direction:column; gap:8px;';
-  if (!opts.allThreads.length) {
-    const empty = document.createElement('div');
-    empty.textContent = 'No cached threads involve this person yet.';
-    empty.style.cssText = 'color:#888; font-style:italic; padding:8px 0;';
-    threadsBox.appendChild(empty);
-  } else {
+  // Render the threads list. Pulled into a closure so the Move-all
+  // picker can re-render it after a bulk move — at that point each
+  // thread's labels have been patched in place by patchLocalThreadLabels,
+  // so the building chips render their new homes.
+  const renderConversations = () => {
+    threadsBox.innerHTML = '';
+    if (!opts.allThreads.length) {
+      const empty = document.createElement('div');
+      empty.textContent = 'No cached threads involve this person yet.';
+      empty.style.cssText = 'color:#888; font-style:italic; padding:8px 0;';
+      threadsBox.appendChild(empty);
+      return;
+    }
     renderEmailListInto(threadsBox, {
       threads: opts.allThreads,
       onSelect: (t) => { closePersonPopup(); opts.onOpenEmail(t); },
       buildingsForThread: opts.buildingsForThread,
     });
-  }
+  };
+  renderConversations();
   rightCol.appendChild(threadsBox);
+  // Stash the re-render handle so the Move-all picker can call it.
+  (opts as any).__refreshConversations = renderConversations;
 
   body.appendChild(rightCol);
   card.appendChild(body);
@@ -508,7 +518,14 @@ function openPersonMoveAllPicker(anchor: HTMLElement, opts: OpenPersonPopupOptio
       r.addEventListener('mouseleave', () => r.style.background = sugg ? 'rgba(106, 210, 106, 0.07)' : 'transparent');
       r.addEventListener('click', async () => {
         pop.remove();
-        try { await opts.onMoveAll!(opts.allThreads, d.labelId, d.buildingName, viaFloor || sugg?.label || undefined); }
+        try {
+          await opts.onMoveAll!(opts.allThreads, d.labelId, d.buildingName, viaFloor || sugg?.label || undefined);
+          // After the bulk move, the in-memory thread objects have
+          // been patched with their new labels — re-render the list
+          // so the building chips reflect the destination.
+          const refresh = (opts as any).__refreshConversations as (() => void) | undefined;
+          if (refresh) refresh();
+        }
         catch (err) { alert(`Move all failed: ${err}`); }
       });
       list.appendChild(r);

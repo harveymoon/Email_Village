@@ -2243,6 +2243,11 @@ class VillageScene extends Phaser.Scene {
     const people = aggregatePeople(allThreads);
     openPeopleGrid({
       people,
+      // Re-snapshot from the live cache whenever a thread changes
+      // read state or labels — the grid uses this to refresh its
+      // per-person unread counts without forcing the user to close
+      // and re-open the grid.
+      refreshPeople: () => aggregatePeople(this.getAllCachedThreads()),
       onPick: (p) => {
         const involves = threadsForPerson(this.getAllCachedThreads(), p.email);
         openPersonPopup({
@@ -3382,6 +3387,14 @@ class VillageScene extends Phaser.Scene {
       if (b) this.bumpBuildingUnread(b.id, -1);
     }
     this.updateBuildingBadges();
+    // Notify any open UI that aggregates read-state across threads
+    // (e.g. the People grid's per-person unread count). Listeners
+    // re-aggregate from emailCache on the next animation frame.
+    try {
+      document.dispatchEvent(new CustomEvent('thread:read-state-changed', {
+        detail: { threadId: t.threadId, isRead: true },
+      }));
+    } catch { }
     // Each NPC carries an array of threadIds for ONE sender. Remove
     // this thread from every matching NPC; despawn the NPC only when
     // ALL its threads have been read.

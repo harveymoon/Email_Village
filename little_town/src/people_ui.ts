@@ -21,11 +21,18 @@ const FRAME = 32;
 // ---------- People grid ----------
 let gridEl: HTMLDivElement | null = null;
 let gridEsc: ((e: KeyboardEvent) => void) | null = null;
+let gridReaggregateListener: ((e: Event) => void) | null = null;
 
 export interface OpenPeopleGridOptions {
   people: Person[];
   onPick: (p: Person) => void;
   onScanAll?: () => Promise<void>;
+  // When provided, the grid listens for thread:read-state-changed and
+  // thread:labels-updated events fired by the scene and re-aggregates
+  // via this callback so the per-person unread counts stay accurate
+  // while the grid is open (e.g. after the user clicks "Mark all read"
+  // from a person profile and returns to the grid).
+  refreshPeople?: () => Person[];
 }
 
 export function openPeopleGrid(opts: OpenPeopleGridOptions): void {
@@ -177,12 +184,39 @@ export function openPeopleGrid(opts: OpenPeopleGridOptions): void {
   gridEl = overlay;
   gridEsc = (e: KeyboardEvent) => { if (e.key === 'Escape') closePeopleGrid(); };
   document.addEventListener('keydown', gridEsc);
+
+  // Re-aggregate + redraw when the scene reports a thread changed
+  // read state or moved buildings. Common case: user opens a person,
+  // clicks "Mark all read", closes the popup — the grid should now
+  // show that person dropped to 0 unread (or sorted lower). Debounced
+  // via rAF so a bulk mark-all-read of N threads triggers one redraw.
+  if (opts.refreshPeople) {
+    let rafPending = false;
+    gridReaggregateListener = () => {
+      if (rafPending || !opts.refreshPeople) return;
+      rafPending = true;
+      requestAnimationFrame(() => {
+        rafPending = false;
+        if (!gridEl || !opts.refreshPeople) return;
+        opts.people = opts.refreshPeople();
+        title.textContent = `👥 People (${opts.people.length})`;
+        render();
+      });
+    };
+    document.addEventListener('thread:read-state-changed', gridReaggregateListener);
+    document.addEventListener('thread:labels-updated', gridReaggregateListener);
+  }
 }
 
 export function closePeopleGrid(): void {
   if (!gridEl) return;
   gridEl.remove(); gridEl = null;
   if (gridEsc) { document.removeEventListener('keydown', gridEsc); gridEsc = null; }
+  if (gridReaggregateListener) {
+    document.removeEventListener('thread:read-state-changed', gridReaggregateListener);
+    document.removeEventListener('thread:labels-updated', gridReaggregateListener);
+    gridReaggregateListener = null;
+  }
 }
 
 function personCard(p: Person, onPick: (p: Person) => void): HTMLDivElement {

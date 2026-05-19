@@ -3067,6 +3067,42 @@ class VillageScene extends Phaser.Scene {
     } catch { }
   }
 
+  // Find any in-memory copy of a thread by id. Returns the first hit
+  // from emailCache — multiple labels may hold the same thread; they
+  // should all share the same object reference by now (set during the
+  // original fetch), so any one is fine for read-only inspection.
+  private findThreadInCache(threadId: string): EmailThread | null {
+    for (const arr of this.emailCache.values()) {
+      for (const t of arr) if (t.threadId === threadId) return t;
+    }
+    return null;
+  }
+
+  // Drop a thread from one label's cached list (and persist the
+  // change). Used after a move so the source label's cache no longer
+  // claims a thread that has been re-filed elsewhere. Other threads
+  // in the cache are untouched — important so unrelated senders stay
+  // visible to the People grid.
+  private removeThreadFromLabelCache(labelName: string, threadId: string): void {
+    const arr = this.emailCache.get(labelName);
+    if (!arr) return;
+    const idx = arr.findIndex(t => t.threadId === threadId);
+    if (idx < 0) return;
+    arr.splice(idx, 1);
+    this.saveToPersistentCache(labelName, arr);
+  }
+
+  // Insert a thread into a label's cached list if it isn't already
+  // there. Skipped when the label has no cache entry yet (next fetch
+  // will pick it up). Persists the updated list.
+  private addThreadToLabelCache(labelName: string, thread: EmailThread): void {
+    const arr = this.emailCache.get(labelName);
+    if (!arr) return;
+    if (arr.some(t => t.threadId === thread.threadId)) return;
+    arr.unshift(thread);     // newest-first matches the API's default order
+    this.saveToPersistentCache(labelName, arr);
+  }
+
   // For a single thread, list the building NAMES it is currently filed
   // under. A thread "lives in" a building when any of that building's
   // bound labels appears on the thread (resolved from raw Gmail ids
@@ -3509,16 +3545,16 @@ class VillageScene extends Phaser.Scene {
     if (postOffice) this.bumpBuildingUnread(postOffice.id, -1);
     if (destBuilding) this.bumpBuildingUnread(destBuilding.id, +1);
     this.updateBuildingBadges();
-    // Invalidate every cache touched: INBOX + the chosen label + every
-    // other label this building binds (their thread counts might shift).
-    this.emailCache.delete('INBOX');
-    this.invalidatePersistentCache('INBOX');
-    for (const n of candidateLabels) {
-      this.emailCache.delete(n);
-      this.invalidatePersistentCache(n);
-    }
-    this.emailCache.delete(chosen);     // covers the override-floor case
-    this.invalidatePersistentCache(chosen);
+    // Surgical cache update: drop the moved thread from INBOX's cached
+    // list, add it to the destination label's cached list. Used to be
+    // a full .delete() of every affected label, which nuked the entire
+    // INBOX cache and made every OTHER thread of every OTHER sender in
+    // the inbox invisible to aggregatePeople / the People grid until
+    // the next full refresh. Surgical update preserves all unrelated
+    // threads + senders in those caches.
+    this.removeThreadFromLabelCache('INBOX', threadId);
+    const movedThread = this.findThreadInCache(threadId);
+    if (movedThread) this.addThreadToLabelCache(chosen, movedThread);
 
     const destDoor = this.findDoorForBuilding(destBuilding);
     if (!destDoor) {
@@ -3626,17 +3662,14 @@ class VillageScene extends Phaser.Scene {
     const toRemove = currentLabelNames.filter(n => n !== opt.fullName && n.startsWith(prefix));
     console.log(`[floor-move] thread=${t.threadId} +"${opt.fullName}" -[${toRemove.join(', ')}]`);
     await api.modify(t.threadId, [opt.fullName], toRemove);
-    // Invalidate caches that grouping depends on: the parent label so
-    // the building popup re-renders the new floor, plus any sub-label
-    // we just removed and the one we just added.
-    this.emailCache.delete(opt.parent);
-    this.invalidatePersistentCache(opt.parent);
-    for (const n of toRemove) {
-      this.emailCache.delete(n);
-      this.invalidatePersistentCache(n);
-    }
-    this.emailCache.delete(opt.fullName);
-    this.invalidatePersistentCache(opt.fullName);
+    // Surgical: patch this thread's labels in memory and update the
+    // caches for the floors involved. Other threads in the parent
+    // label's cache stay put — used to be a blanket .delete() that
+    // dropped the parent's entire cached list.
+    this.patchLocalThreadLabels(t.threadId, opt.fullName, toRemove);
+    for (const n of toRemove) this.removeThreadFromLabelCache(n, t.threadId);
+    const patched = this.findThreadInCache(t.threadId);
+    if (patched) this.addThreadToLabelCache(opt.fullName, patched);
   }
 
   // Move EVERY thread carried by a specific NPC to one destination in
@@ -3673,26 +3706,28 @@ class VillageScene extends Phaser.Scene {
     // Apply per-thread (each may need a different per-account label).
     // If an overrideLabel (floor match) was supplied, use it whenever
     // that exact label exists in the thread's account; otherwise fall
-    // back to the building's bound labels.
-    for (const tid of threadIds) {
+    // back to the building's bound labels. Each successful move ALSO
+    // patches the cache surgically — removing the thread from INBOX
+    // and adding it to its new label's cache — so other threads /
+    // senders in those caches stay visible (the previous .delete()
+    // was wiping inbox entirely, hiding every other inbox sender from
+    // the People grid after a single move).
+    await Promise.all(threadIds.map(async (tid) => {
       const acct = tid.split(':')[0];
       const inAcct = (this.labelCache || []).filter(l => l.account === acct).map(l => l.name);
       const chosen = (overrideLabel && inAcct.includes(overrideLabel))
         ? overrideLabel
         : (candidateLabels.find(n => inAcct.includes(n)) || candidateLabels[0]);
-      try { await api.modify(tid, [chosen], ['INBOX']); }
-      catch (err) { console.warn(`[moveAll] failed for ${tid}:`, err); }
-    }
-    this.emailCache.delete('INBOX');
-    this.invalidatePersistentCache('INBOX');
-    for (const n of candidateLabels) {
-      this.emailCache.delete(n);
-      this.invalidatePersistentCache(n);
-    }
-    if (overrideLabel) {
-      this.emailCache.delete(overrideLabel);
-      this.invalidatePersistentCache(overrideLabel);
-    }
+      try {
+        await api.modify(tid, [chosen], ['INBOX']);
+        this.patchLocalThreadLabels(tid, chosen, ['INBOX']);
+        this.removeThreadFromLabelCache('INBOX', tid);
+        const t = this.findThreadInCache(tid);
+        if (t) this.addThreadToLabelCache(chosen, t);
+      } catch (err) {
+        console.warn(`[moveAll] failed for ${tid}:`, err);
+      }
+    }));
 
     // Drain the NPC's thread list and walk once.
     data.threadIds = [];

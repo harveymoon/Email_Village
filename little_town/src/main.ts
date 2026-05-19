@@ -2557,7 +2557,17 @@ class VillageScene extends Phaser.Scene {
     // get orphaned). Derive unique accounts from the thread ids.
     const tids: string[] = (npc.data as any)?.threadIds || [];
     const accounts = [...new Set(tids.map(id => id.split(':')[0]))];
-    const destinations = this.destinationsForMove(accounts);
+    // ALL threads on a single NPC come from the same sender (the spawn
+    // groups by sender per building), so we can use ANY of the NPC's
+    // threads as the "representative" for suggestion lookup. Without
+    // this the move-all picker would have no `forThread` and skip
+    // rule / sender-history / domain suggestions entirely.
+    let repThread: EmailThread | undefined;
+    for (const tid of tids) {
+      const t = this.findCachedThread(tid);
+      if (t) { repThread = t; break; }
+    }
+    const destinations = this.destinationsForMove(accounts, repThread);
     const pop = document.createElement('div');
     pop.setAttribute('data-npc-move', '1');
     pop.style.cssText = `

@@ -248,6 +248,10 @@ export interface OpenPersonPopupOptions {
   // ONE destination and applies it to every thread on this profile.
   destinationsForPerson?: (threads: EmailThread[]) => Array<{ labelId: string; label: string; buildingName: string; floors?: string[]; suggestion?: { confidence: number; reason: string; label?: string } }>;
   onMoveAll?: (threads: EmailThread[], destLabelId: string, destBuildingName: string, overrideLabel?: string) => Promise<void>;
+  // Mark every conversation from this person as read in one shot — for
+  // notification-style senders the user wants to keep around but doesn't
+  // want to open one by one.
+  onMarkAllRead?: (threads: EmailThread[]) => Promise<void>;
 }
 
 export function openPersonPopup(opts: OpenPersonPopupOptions): void {
@@ -403,6 +407,43 @@ export function openPersonPopup(opts: OpenPersonPopupOptions): void {
   convTitle.textContent = `Conversations (${opts.allThreads.length})`;
   convTitle.style.cssText = 'color:#aaa; font-size:13px; text-transform:uppercase; letter-spacing:0.06em; flex:1 1 auto;';
   convHeader.appendChild(convTitle);
+  // "Mark all read" — only shown when at least one thread is unread.
+  const unreadCount = opts.allThreads.filter(t => !t.isRead).length;
+  if (unreadCount > 0 && opts.onMarkAllRead) {
+    const markBtn = document.createElement('button');
+    markBtn.type = 'button';
+    markBtn.textContent = `✓ Mark ${unreadCount} read`;
+    markBtn.title = `Mark every unread conversation from ${opts.person.name || opts.person.email} as read without opening them`;
+    markBtn.style.cssText = `
+      background:#203030; color:#a8e6c0; border:1px solid #2c5e4a; border-radius:14px;
+      padding:4px 12px; cursor:pointer; flex:0 0 auto;
+      font:600 12px ui-sans-serif,system-ui,sans-serif;
+    `;
+    markBtn.addEventListener('mouseenter', () => { markBtn.style.background = '#2a4040'; });
+    markBtn.addEventListener('mouseleave', () => { markBtn.style.background = '#203030'; });
+    markBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      if (markBtn.disabled) return;
+      markBtn.disabled = true;
+      markBtn.style.opacity = '0.65';
+      const orig = markBtn.textContent;
+      markBtn.textContent = 'Marking…';
+      try {
+        const unread = opts.allThreads.filter(t => !t.isRead);
+        await opts.onMarkAllRead!(unread);
+        // Re-render so the unread row highlights drop and the button
+        // disappears (no more unread to mark).
+        const refresh = (opts as any).__refreshConversations as (() => void) | undefined;
+        if (refresh) refresh();
+        markBtn.remove();
+      } catch (err) {
+        markBtn.textContent = orig || '✓ Mark read';
+        markBtn.disabled = false; markBtn.style.opacity = '1';
+        alert(`Mark read failed: ${err}`);
+      }
+    });
+    convHeader.appendChild(markBtn);
+  }
   if (opts.allThreads.length && opts.destinationsForPerson && opts.onMoveAll) {
     const moveAllBtn = document.createElement('button');
     moveAllBtn.type = 'button';

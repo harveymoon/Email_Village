@@ -2229,6 +2229,12 @@ class VillageScene extends Phaser.Scene {
           catch (err) { console.warn(`[moveAll-person] ${t.threadId}:`, err); }
         }
       },
+      onMarkAllRead: async (threads) => {
+        for (const t of threads) {
+          try { this.markThreadRead(t); }
+          catch (err) { console.warn(`[markAllRead-person] ${t.threadId}:`, err); }
+        }
+      },
     });
   }
 
@@ -2255,6 +2261,12 @@ class VillageScene extends Phaser.Scene {
             for (const t of threads) {
               try { await this.moveThread(t.threadId, destLabelId, destBuilding, overrideLabel); }
               catch (err) { console.warn(`[moveAll-person] ${t.threadId}:`, err); }
+            }
+          },
+          onMarkAllRead: async (threads) => {
+            for (const t of threads) {
+              try { this.markThreadRead(t); }
+              catch (err) { console.warn(`[markAllRead-person] ${t.threadId}:`, err); }
             }
           },
         });
@@ -3339,6 +3351,12 @@ class VillageScene extends Phaser.Scene {
   // despawns any NPCs representing that thread (they've "gone inside"
   // since read emails don't get an outside-the-building NPC).
   private markThreadRead(t: EmailThread): void {
+    if (t.isRead) return;       // already done — keep call idempotent
+    // Find which buildings this thread is currently filed under BEFORE
+    // we strip the UNREAD label. Each one's unread badge needs to drop
+    // by 1 since the thread will no longer count toward its labels'
+    // threadsUnread tallies.
+    const beforeBuildings = this.buildingsContainingThread(t);
     t.isRead = true;
     t.labels = t.labels.filter(l => l !== 'UNREAD');
     for (const m of t.messages) {
@@ -3346,6 +3364,14 @@ class VillageScene extends Phaser.Scene {
       m.labels = m.labels.filter(l => l !== 'UNREAD');
     }
     applyReadStateToRow(t.threadId, true);
+    // Apply the per-building decrement. Lookup by NAME since
+    // buildingsContainingThread returns names; safe because building
+    // names are user-settable but unique within the world.
+    for (const name of beforeBuildings) {
+      const b = this.buildings.find(bb => bb.name === name);
+      if (b) this.bumpBuildingUnread(b.id, -1);
+    }
+    this.updateBuildingBadges();
     // Each NPC carries an array of threadIds for ONE sender. Remove
     // this thread from every matching NPC; despawn the NPC only when
     // ALL its threads have been read.

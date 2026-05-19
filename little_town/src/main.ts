@@ -3260,6 +3260,11 @@ class VillageScene extends Phaser.Scene {
     }));
     console.log(`[npc-spawn] spawned ${this.npcs.length} person-NPCs across ${labelled.length} buildings`);
     this.updateBuildingBadges();
+    // Kick off authoritative unread counts in the background so badges
+    // settle to Gmail truth — important when the user's inbox is bigger
+    // than THREAD_LIMIT and the NPC-derived count under-reports.
+    this.refreshBuildingUnreadCounts().catch(err =>
+      console.warn('[badges] unread refresh failed:', err));
   }
 
   // Spawn a single NPC for one sender at this building, carrying all
@@ -3425,6 +3430,14 @@ class VillageScene extends Phaser.Scene {
     // this patch the chips stay frozen on the old building until the
     // user closes & reopens the popup.
     this.patchLocalThreadLabels(threadId, chosen, ['INBOX']);
+    // Optimistic badge bookkeeping: the thread just left INBOX (Post
+    // Office) and arrived at the destination. Apply both deltas locally
+    // so the badge ticks down instantly — refreshBuildingUnreadCounts
+    // (run on next spawn/refresh) re-syncs with Gmail truth.
+    const postOffice = this.buildings.find(b => getBuildingLabels(b).includes('INBOX'));
+    if (postOffice) this.bumpBuildingUnread(postOffice.id, -1);
+    if (destBuilding) this.bumpBuildingUnread(destBuilding.id, +1);
+    this.updateBuildingBadges();
     // Invalidate every cache touched: INBOX + the chosen label + every
     // other label this building binds (their thread counts might shift).
     this.emailCache.delete('INBOX');
@@ -3688,7 +3701,19 @@ class VillageScene extends Phaser.Scene {
     b.badge.setPosition(rightEdge + 6 + b.badge.displayWidth / 2, b.label.y - 4);
   }
 
+  // Per-building TRUE unread counts from the Gmail API. Survives the
+  // THREAD_LIMIT cap on spawn (only 250 NPCs render but the badge
+  // reflects the full inbox). Decremented locally on each successful
+  // move and re-fetched on respawn/refresh so the user sees a number
+  // that monotonically drops as they file mail away — instead of the
+  // old behaviour where moving 50 out and reloading silently surfaced
+  // the next 50 in the backlog and the badge "popped back up."
+  private apiUnreadByBuilding = new Map<number, number>();
+
   private unreadCountForBuilding(b: Building): number {
+    const fromApi = this.apiUnreadByBuilding.get(b.id);
+    if (typeof fromApi === 'number') return fromApi;
+    // Fallback to NPC threadIds while the API call is in flight.
     let n = 0;
     for (const npc of this.npcs) {
       const data = npc.data as any;
@@ -3697,6 +3722,38 @@ class VillageScene extends Phaser.Scene {
       n += tids.length;
     }
     return n;
+  }
+
+  // Re-fetch the authoritative unread count for every labeled building
+  // and refresh the badges. Cheap (one Gmail messages.list per label,
+  // capped at q=1 — Gmail returns resultSizeEstimate without paginating).
+  // Called once after spawn and after every full refresh.
+  async refreshBuildingUnreadCounts(): Promise<void> {
+    const targets = this.buildings.filter(b => getBuildingLabels(b).length > 0);
+    await Promise.all(targets.map(async (b) => {
+      const names = getBuildingLabels(b);
+      try {
+        const counts = await Promise.all(names.map(n => {
+          const args = n === 'INBOX' ? { labelIds: 'INBOX' } : { labelName: n };
+          return api.unreadCount(args).then(r => r.count).catch(() => 0);
+        }));
+        const total = counts.reduce((a, c) => a + c, 0);
+        this.apiUnreadByBuilding.set(b.id, total);
+      } catch {
+        // Leave the previous cached value alone on transient failure.
+      }
+    }));
+    this.updateBuildingBadges();
+  }
+
+  // Optimistic local decrement. moveThread calls this once per moved
+  // thread so badges drop instantly without a round trip. Re-converges
+  // with Gmail truth on the next refreshBuildingUnreadCounts.
+  private bumpBuildingUnread(buildingId: number, delta: number): void {
+    const cur = this.apiUnreadByBuilding.get(buildingId);
+    if (typeof cur === 'number') {
+      this.apiUnreadByBuilding.set(buildingId, Math.max(0, cur + delta));
+    }
   }
 
   // Recompute every building's label. Cheap (one O(npcs) scan + one

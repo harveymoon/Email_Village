@@ -3105,11 +3105,14 @@ class VillageScene extends Phaser.Scene {
 
   // For a single thread, list the building NAMES it is currently filed
   // under. A thread "lives in" a building when any of that building's
-  // bound labels appears on the thread (resolved from raw Gmail ids
-  // via the label cache, per the thread's owning account). INBOX maps
-  // to the Post Office because Post_Office is the conventional name
-  // for the INBOX-bound building. Used by the person profile to show
-  // a per-conversation badge.
+  // bound labels appears on the thread — OR when any of the thread's
+  // labels is a sub-label of a bound label (so a building bound to
+  // "Hobbies" still claims a thread carrying "Hobbies/Patreon", and
+  // a building bound to "Archive" still claims "Archive/NTT" etc.).
+  // Without that prefix match, moves where the chosen label is a
+  // floor sub-label would silently drop the building chip.
+  // INBOX maps to whichever building is bound to "INBOX" (Post Office
+  // by convention).
   private buildingsContainingThread(t: EmailThread): string[] {
     const labels = this.labelCache || [];
     const account = t.account;
@@ -3122,7 +3125,13 @@ class VillageScene extends Phaser.Scene {
     const out: string[] = [];
     for (const b of this.buildings) {
       const bound = getBuildingLabels(b);
-      if (bound.some(n => nameOnThread.has(n))) out.push(b.name);
+      const match = bound.some(n =>
+        nameOnThread.has(n) ||                     // exact bound label is on the thread
+        [...nameOnThread].some(threadLabel =>      // OR thread has a sub-label of bound
+          threadLabel.startsWith(`${n}/`)
+        ),
+      );
+      if (match) out.push(b.name);
     }
     return out;
   }

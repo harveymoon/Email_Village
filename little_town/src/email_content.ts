@@ -22,7 +22,15 @@ export interface OpenEmailPopupOptions {
   threadId?: string;
   thread?: EmailThread;
   // Destination picker. Each entry becomes a button in the Move menu.
-  destinations: Array<{ labelId: string; label: string; buildingName: string }>;
+  // floors + suggestion are optional and only consumed by the floor
+  // search / rule-suggestion decoration logic.
+  destinations: Array<{
+    labelId: string;
+    label: string;
+    buildingName: string;
+    floors?: string[];
+    suggestion?: { confidence: number; reason: string; label?: string };
+  }>;
   // Called when user picks a destination. Implementer is the scene —
   // it should call the backend modify endpoint and animate NPCs.
   onMove: (threadId: string, destLabelId: string, destBuilding: string, overrideLabel?: string) => Promise<void>;
@@ -310,9 +318,13 @@ function openMoveMenu(anchor: HTMLElement, t: EmailThread, opts: OpenEmailPopupO
         item.style.cssText = 'padding:10px 14px; cursor:pointer; border-radius:4px; display:flex; justify-content:space-between; align-items:center; gap:12px;';
         const left = document.createElement('div');
         const viaFloor = q ? matchedFloor(d, q) : null;
-        const subText = viaFloor ? `via ${viaFloor}` : d.label;
-        const subColor = viaFloor ? '#a8e6c0' : '#7a8b9f';
         const sugg = applySuggestionStyle(item, d);
+        // Show the rule's specific floor in the sub-line when it
+        // differs from the building's bound label (rule says
+        // Hobbies/Patreon → row shows Hobbies/Patreon, not Hobbies).
+        const suggFloor = (!viaFloor && sugg && sugg.label && sugg.label !== d.label) ? sugg.label : null;
+        const subText = viaFloor ? `via ${viaFloor}` : (suggFloor || d.label);
+        const subColor = viaFloor || suggFloor ? '#a8e6c0' : '#7a8b9f';
         const suggLine = sugg
           ? `<div style="color:#6ad26a; font:600 10px ui-monospace,Consolas,monospace;">✨ Suggested · ${escapeHtml(sugg.reason)}</div>`
           : '';
@@ -325,7 +337,10 @@ function openMoveMenu(anchor: HTMLElement, t: EmailThread, opts: OpenEmailPopupO
         item.addEventListener('click', async () => {
           menu.remove();
           try {
-            await opts.onMove(t.threadId, d.labelId, d.buildingName, viaFloor || undefined);
+            // Override label priority: explicit floor-search match wins
+            // over the rule-suggestion's matched label. Either flows
+            // through onMove so the right sub-label is applied.
+            await opts.onMove(t.threadId, d.labelId, d.buildingName, viaFloor || sugg?.label || undefined);
             closeEmailContentPopup();
           } catch (err) {
             alert(`Move failed: ${err}`);

@@ -2611,9 +2611,13 @@ class VillageScene extends Phaser.Scene {
         const r = document.createElement('div');
         r.style.cssText = 'padding:8px 10px; cursor:pointer; border-radius:4px;';
         const viaFloor = q ? matchedFloor(d, q) : null;
-        const subText = viaFloor ? `via ${viaFloor}` : d.label;
-        const subColor = viaFloor ? '#a8e6c0' : '#7a8b9f';
         const sugg = applySuggestionStyle(r, d);
+        // When a rule suggestion targets a sub-label (e.g. Hobbies/Patreon
+        // on a building bound to Hobbies), surface that path in the
+        // sub-line so the user can see which floor the click will file to.
+        const suggFloor = (!viaFloor && sugg && sugg.label && sugg.label !== d.label) ? sugg.label : null;
+        const subText = viaFloor ? `via ${viaFloor}` : (suggFloor || d.label);
+        const subColor = viaFloor ? '#a8e6c0' : (suggFloor ? '#a8e6c0' : '#7a8b9f');
         const suggLine = sugg
           ? `<div style="color:#6ad26a; font:600 10px ui-monospace,Consolas,monospace;">✨ Suggested · ${escapeHtml(sugg.reason)}</div>`
           : '';
@@ -2624,7 +2628,12 @@ class VillageScene extends Phaser.Scene {
         r.addEventListener('click', async () => {
           pop.remove();
           document.querySelectorAll('[data-npc-action]').forEach(el => el.remove());
-          try { await this.moveAllForNpc(npc, d.labelId, d.buildingName, viaFloor || undefined); }
+          // Override label priority: explicit floor-search match wins
+          // over the suggestion's matched label. Both end up calling
+          // moveThread/moveAllForNpc with overrideLabel so the right
+          // sub-label gets applied (rule → Hobbies/Patreon, not just
+          // the parent Hobbies).
+          try { await this.moveAllForNpc(npc, d.labelId, d.buildingName, viaFloor || sugg?.label || undefined); }
           catch (err) { alert(`Move all failed: ${err}`); }
         });
         list.appendChild(r);
@@ -2705,9 +2714,13 @@ class VillageScene extends Phaser.Scene {
         const r = document.createElement('div');
         r.style.cssText = 'padding:8px 10px; cursor:pointer; border-radius:4px;';
         const viaFloor = q ? matchedFloor(d, q) : null;
-        const subText = viaFloor ? `via ${viaFloor}` : d.label;
-        const subColor = viaFloor ? '#a8e6c0' : '#7a8b9f';
         const sugg = applySuggestionStyle(r, d);
+        // When a rule suggestion targets a sub-label (e.g. Hobbies/Patreon
+        // on a building bound to Hobbies), surface that path in the
+        // sub-line so the user can see which floor the click will file to.
+        const suggFloor = (!viaFloor && sugg && sugg.label && sugg.label !== d.label) ? sugg.label : null;
+        const subText = viaFloor ? `via ${viaFloor}` : (suggFloor || d.label);
+        const subColor = viaFloor ? '#a8e6c0' : (suggFloor ? '#a8e6c0' : '#7a8b9f');
         const suggLine = sugg
           ? `<div style="color:#6ad26a; font:600 10px ui-monospace,Consolas,monospace;">✨ Suggested · ${escapeHtml(sugg.reason)}</div>`
           : '';
@@ -2718,7 +2731,12 @@ class VillageScene extends Phaser.Scene {
         r.addEventListener('click', async () => {
           pop.remove();
           document.querySelectorAll('[data-npc-action]').forEach(el => el.remove());
-          try { await this.moveThread(threadId, d.labelId, d.buildingName, viaFloor || undefined); }
+          // Override label priority: explicit floor-search match wins
+          // over the rule-suggestion's matched label. Either way the
+          // specific sub-label flows through to moveThread so the
+          // email files under the right floor (e.g. Hobbies/Patreon,
+          // not just Hobbies).
+          try { await this.moveThread(threadId, d.labelId, d.buildingName, viaFloor || sugg?.label || undefined); }
           catch (err) { alert(`Move failed: ${err}`); }
         });
         list.appendChild(r);
@@ -2862,7 +2880,12 @@ class VillageScene extends Phaser.Scene {
         out.push({
           labelName: m.labelName,
           confidence: 1.0,
-          reason: `Matches your rule on ${m.account}`,
+          // Spell out the destination label in the reason. When the
+          // rule targets a floor (e.g. Hobbies/Patreon) the popup row
+          // shows only the building label ("Hobbies") in its sub-line,
+          // so without this text the user has no signal that clicking
+          // will file to the specific floor.
+          reason: `Rule on ${m.account} → ${m.labelName}`,
         });
       }
     } else {
@@ -2914,7 +2937,7 @@ class VillageScene extends Phaser.Scene {
     return out;
   }
 
-  private destinationsForMove(threadAccounts?: string | string[], forThread?: EmailThread): Array<{ labelId: string; label: string; buildingName: string; floors: string[]; searchText: string; suggestion?: { confidence: number; reason: string } }> {
+  private destinationsForMove(threadAccounts?: string | string[], forThread?: EmailThread): Array<{ labelId: string; label: string; buildingName: string; floors: string[]; searchText: string; suggestion?: { confidence: number; reason: string; label: string } }> {
     const accounts = typeof threadAccounts === 'string' ? [threadAccounts]
       : Array.isArray(threadAccounts) ? threadAccounts : null;
     const allLabels = this.labelCache || [];
@@ -2959,11 +2982,15 @@ class VillageScene extends Phaser.Scene {
         const searchText = [b.name, ...names, ...floors].join(' ').toLowerCase();
         // Find the highest-confidence suggestion that mentions any of
         // this building's bound labels or any of its floor sub-labels.
-        let suggestion: { confidence: number; reason: string } | undefined;
+        // Remember the matched label so click handlers can pass it as
+        // overrideLabel — letting a "rule says Hobbies/Patreon" hint
+        // actually file the email under Hobbies/Patreon (not just the
+        // parent Hobbies building label).
+        let suggestion: { confidence: number; reason: string; label: string } | undefined;
         for (const n of [...names, ...floors]) {
           const s = suggestionByLabel.get(n);
           if (s && (!suggestion || s.confidence > suggestion.confidence)) {
-            suggestion = { confidence: s.confidence, reason: s.reason };
+            suggestion = { confidence: s.confidence, reason: s.reason, label: n };
           }
         }
         return { labelId: `building:${b.id}`, label: summary, buildingName: b.name, floors, searchText, suggestion };

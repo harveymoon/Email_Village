@@ -112,8 +112,8 @@ export function matchedFloor(
 // if the destination wasn't suggested.
 export function applySuggestionStyle(
   row: HTMLElement,
-  d: { suggestion?: { confidence: number; reason: string } },
-): { confidence: number; reason: string } | null {
+  d: { suggestion?: { confidence: number; reason: string; label?: string } },
+): { confidence: number; reason: string; label?: string } | null {
   if (!d.suggestion) return null;
   row.style.borderLeft = '3px solid #6ad26a';
   row.style.background = 'rgba(106, 210, 106, 0.07)';
@@ -156,7 +156,7 @@ function renderWithFloors(
   parents: string[],
   labels: GmailLabel[],
   onSelect: (t: EmailThread) => void,
-  destinationsFor?: (t: EmailThread) => Array<{ labelId: string; label: string; buildingName: string }>,
+  destinationsFor?: (t: EmailThread) => Array<{ labelId: string; label: string; buildingName: string; floors?: string[]; suggestion?: { confidence: number; reason: string; label?: string } }>,
   onMove?: (threadId: string, destLabelId: string, destBuildingName: string, overrideLabel?: string) => Promise<void>,
   floorsFor?: (t: EmailThread) => FloorOption[],
   onMoveToFloor?: (t: EmailThread, opt: FloorOption) => Promise<void>,
@@ -220,7 +220,7 @@ function makeFloor(
   threads: EmailThread[],
   unread: number,
   onSelect: (t: EmailThread) => void,
-  destinationsFor?: (t: EmailThread) => Array<{ labelId: string; label: string; buildingName: string }>,
+  destinationsFor?: (t: EmailThread) => Array<{ labelId: string; label: string; buildingName: string; floors?: string[]; suggestion?: { confidence: number; reason: string; label?: string } }>,
   onMove?: (threadId: string, destLabelId: string, destBuildingName: string, overrideLabel?: string) => Promise<void>,
   floorsFor?: (t: EmailThread) => FloorOption[],
   onMoveToFloor?: (t: EmailThread, opt: FloorOption) => Promise<void>,
@@ -347,7 +347,7 @@ function dateColumn(t: EmailThread): HTMLDivElement {
 function makeRow(
   t: EmailThread,
   onSelect: (t: EmailThread) => void,
-  destinationsFor?: (t: EmailThread) => Array<{ labelId: string; label: string; buildingName: string }>,
+  destinationsFor?: (t: EmailThread) => Array<{ labelId: string; label: string; buildingName: string; floors?: string[]; suggestion?: { confidence: number; reason: string; label?: string } }>,
   onMove?: (threadId: string, destLabelId: string, destBuildingName: string, overrideLabel?: string) => Promise<void>,
   floorsFor?: (t: EmailThread) => FloorOption[],
   onMoveToFloor?: (t: EmailThread, opt: FloorOption) => Promise<void>,
@@ -546,8 +546,14 @@ function openFloorMovePopover(
 // also fire and open the email content popup.
 function quickMoveButton(
   t: EmailThread,
-  destinations: Array<{ labelId: string; label: string; buildingName: string }>,
-  onMove: (threadId: string, destLabelId: string, destBuildingName: string) => Promise<void>,
+  destinations: Array<{
+    labelId: string;
+    label: string;
+    buildingName: string;
+    floors?: string[];
+    suggestion?: { confidence: number; reason: string; label?: string };
+  }>,
+  onMove: (threadId: string, destLabelId: string, destBuildingName: string, overrideLabel?: string) => Promise<void>,
   row: HTMLDivElement,
 ): HTMLDivElement {
   const wrap = document.createElement('div');
@@ -572,8 +578,14 @@ function quickMoveButton(
 function openQuickMovePopover(
   anchor: HTMLElement,
   t: EmailThread,
-  destinations: Array<{ labelId: string; label: string; buildingName: string }>,
-  onMove: (threadId: string, destLabelId: string, destBuildingName: string) => Promise<void>,
+  destinations: Array<{
+    labelId: string;
+    label: string;
+    buildingName: string;
+    floors?: string[];
+    suggestion?: { confidence: number; reason: string; label?: string };
+  }>,
+  onMove: (threadId: string, destLabelId: string, destBuildingName: string, overrideLabel?: string) => Promise<void>,
   row: HTMLDivElement,
 ): void {
   document.querySelectorAll('[data-quick-move]').forEach(el => el.remove());
@@ -612,10 +624,13 @@ function openQuickMovePopover(
       top.style.cssText = 'font:600 13px ui-sans-serif,system-ui,sans-serif; color:#fff;';
       const sub = document.createElement('div');
       const viaFloor = q ? matchedFloor(d, q) : null;
-      sub.textContent = viaFloor ? `via ${viaFloor}` : d.label;
-      sub.style.cssText = `color:${viaFloor ? '#a8e6c0' : '#7a8b9f'}; font:11px ui-monospace,Consolas,monospace; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;`;
-      r.appendChild(top); r.appendChild(sub);
       const sugg = applySuggestionStyle(r, d);
+      // When the rule suggestion targets a sub-label, show that path
+      // here so the user sees which floor will receive the email.
+      const suggFloor = (!viaFloor && sugg && sugg.label && sugg.label !== d.label) ? sugg.label : null;
+      sub.textContent = viaFloor ? `via ${viaFloor}` : (suggFloor || d.label);
+      sub.style.cssText = `color:${viaFloor || suggFloor ? '#a8e6c0' : '#7a8b9f'}; font:11px ui-monospace,Consolas,monospace; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;`;
+      r.appendChild(top); r.appendChild(sub);
       if (sugg) {
         const tag = document.createElement('div');
         tag.textContent = `✨ Suggested · ${sugg.reason}`;
@@ -631,10 +646,10 @@ function openQuickMovePopover(
         try {
           // Optimistically fade the row to indicate the move is in flight.
           row.style.opacity = '0.5'; row.style.pointerEvents = 'none';
-          // If the row was matched via a floor, hand that floor to the
-          // move handler so it applies the specific sub-label instead
-          // of the building's generic parent label.
-          await onMove(t.threadId, d.labelId, d.buildingName, viaFloor || undefined);
+          // Override label priority: floor-search match wins over
+          // rule-suggestion's matched label. Either applies the
+          // specific sub-label instead of the generic parent.
+          await onMove(t.threadId, d.labelId, d.buildingName, viaFloor || sugg?.label || undefined);
           row.remove();
         } catch (err) {
           row.style.opacity = '1'; row.style.pointerEvents = 'auto';

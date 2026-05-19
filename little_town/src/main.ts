@@ -3028,6 +3028,16 @@ class VillageScene extends Phaser.Scene {
     };
     for (const arr of this.emailCache.values()) for (const t of arr) apply(t);
     if (patched > 0) console.log(`[move] patched labels on ${patched} cached thread copies`);
+    // Notify any open UI that holds its own thread references (e.g. the
+    // person profile popup includes threads it fetched fresh from
+    // /api/threads/:id — those never lived in emailCache so the loop
+    // above doesn't reach them). Listeners patch their own copies and
+    // schedule a re-render.
+    try {
+      document.dispatchEvent(new CustomEvent('thread:labels-updated', {
+        detail: { threadId, addedRawId: addRaw || null, removedRawIds: [...removeRawSet] },
+      }));
+    } catch { }
   }
 
   // For a single thread, list the building NAMES it is currently filed

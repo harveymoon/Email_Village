@@ -229,6 +229,7 @@ function personCard(p: Person, onPick: (p: Person) => void): HTMLDivElement {
 // ---------- Individual person popup ----------
 let personEl: HTMLDivElement | null = null;
 let personEsc: ((e: KeyboardEvent) => void) | null = null;
+let personLabelsListener: ((e: Event) => void) | null = null;
 
 export interface OpenPersonPopupOptions {
   person: Person;
@@ -498,12 +499,40 @@ export function openPersonPopup(opts: OpenPersonPopupOptions): void {
   personEl = overlay;
   personEsc = (e: KeyboardEvent) => { if (e.key === 'Escape') closePersonPopup(); };
   document.addEventListener('keydown', personEsc);
+
+  // Listen for thread label patches dispatched by moveThread (it can't
+  // reach opts.allThreads directly because the popup may hold threads
+  // it fetched fresh outside the scene's emailCache). Patch matching
+  // entries in place and schedule a debounced re-render so a bulk move
+  // of N threads results in ONE conversation-list redraw, not N.
+  let rafPending = false;
+  personLabelsListener = (e: Event) => {
+    const detail = (e as CustomEvent).detail as { threadId: string; addedRawId: string | null; removedRawIds: string[] };
+    if (!detail) return;
+    let touched = false;
+    for (const t of opts.allThreads) {
+      if (t.threadId !== detail.threadId) continue;
+      const before = t.labels.length;
+      t.labels = t.labels.filter(rid => !detail.removedRawIds.includes(rid));
+      if (detail.addedRawId && !t.labels.includes(detail.addedRawId)) t.labels.push(detail.addedRawId);
+      if (t.labels.length !== before || (detail.addedRawId && t.labels.includes(detail.addedRawId))) touched = true;
+    }
+    if (touched && !rafPending) {
+      rafPending = true;
+      requestAnimationFrame(() => {
+        rafPending = false;
+        renderConversations();
+      });
+    }
+  };
+  document.addEventListener('thread:labels-updated', personLabelsListener);
 }
 
 export function closePersonPopup(): void {
   if (!personEl) return;
   personEl.remove(); personEl = null;
   if (personEsc) { document.removeEventListener('keydown', personEsc); personEsc = null; }
+  if (personLabelsListener) { document.removeEventListener('thread:labels-updated', personLabelsListener); personLabelsListener = null; }
 }
 
 // Move-all picker for a person profile. Same UX as the per-row Move-to

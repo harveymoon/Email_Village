@@ -140,8 +140,14 @@ export class NPC {
     (this.sprite as any).npc = this;
     this.lastX = this.sprite.x;
     this.lastY = this.sprite.y;
-    // Start in idle so freshly-spawned NPCs don't immediately walk.
-    this.idleUntilMs = performance.now() + this.randomIdleMs();
+    // Short jittered first-tick delay so spawn isn't an immediate
+    // sprint AND so NPCs piled on the same door spread out over a
+    // second instead of trying to all wander on the exact same frame.
+    // The previous full randomIdleMs() (20–60s) made them stand in a
+    // motionless stack at the door for almost a minute before the
+    // first repickGoal() ever ran — they should start loitering away
+    // from the door pretty much immediately.
+    this.idleUntilMs = performance.now() + 200 + Math.random() * 1200;
     // If the spawn position drifted (random scatter) more than a tile
     // away from the door, send the NPC to the door first so wander
     // happens from "the front of the building" outward.

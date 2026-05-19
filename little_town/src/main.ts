@@ -2249,7 +2249,14 @@ class VillageScene extends Phaser.Scene {
   //   header: "📬 N unread from <sender>"
   //   per-thread row: subject + [Read] [Move to…]
   //   footer (multi only): [Move all to …]
-  private openNpcActionMenu(npc: NPC, screenX: number, screenY: number): void {
+  private async openNpcActionMenu(npc: NPC, screenX: number, screenY: number): Promise<void> {
+    // Make sure the rules cache is ready BEFORE we build any DOM so
+    // the Rules section can render its full content on first paint —
+    // no "Loading rules…" placeholder, no post-mount mutation. After
+    // the first session-bootstrap load this is a no-op (cache hit).
+    if (!this.rulesCache) {
+      try { await this.loadRulesCache(); } catch { /* fall through; section will just show empty */ }
+    }
     document.querySelectorAll('[data-npc-action]').forEach(el => el.remove());
     const data = (npc.data || {}) as any;
     const threadIds: string[] = Array.isArray(data.threadIds) ? [...data.threadIds]
@@ -2474,9 +2481,11 @@ class VillageScene extends Phaser.Scene {
         accounts: this.currentAccounts,
         labels: this.labelCache,
         onSaved: () => {
-          // Re-render the rules section in place so the new rule shows
-          // up immediately without needing to re-open the popup.
-          renderRules();
+          // Force-refresh the scene rules cache, THEN re-render so the
+          // new rule shows. Without the explicit wait we'd read the
+          // stale cache before the dispatched 'rules:updated' listener
+          // finished its background fetch.
+          this.loadRulesCache(true).then(() => renderRules()).catch(() => renderRules());
         },
         prefill: {
           criteria: { from: fromEmail },
@@ -2493,55 +2502,47 @@ class VillageScene extends Phaser.Scene {
     wrap.appendChild(list);
 
     const renderRules = () => {
-      list.innerHTML = '<div style="color:#666; font-style:italic; font-size:12px;">Loading rules…</div>';
-      api.filters().then(rules => {
-        list.innerHTML = '';
-        // Token-aware match against the filter's `from` clause. Naive
-        // substring matching is wrong because filters on different
-        // addresses sharing a domain (e.g. payments-noreply@google.com
-        // and meetings-noreply@google.com) would falsely cross-match.
-        // We split on whitespace/commas/OR and accept tokens as either:
-        //   - an exact email address (must equal sender)
-        //   - "@domain.com" (matches any sender on that domain)
-        //   - a bare domain "domain.com" (matches sender on that domain)
-        const senderEmail = fromEmail.toLowerCase();
-        const matches = rules.filter(r => {
-          if (r.error) return false;
-          const from = (r.criteria?.from || '').toLowerCase().trim();
-          if (!from) return false;
-          const tokens = from.split(/[\s,]+|\bor\b/i).map(s => s.trim()).filter(Boolean);
-          return tokens.some(tok => {
-            if (tok === senderEmail) return true;
-            if (tok.startsWith('@')) return senderEmail.endsWith(tok);
-            if (!tok.includes('@') && tok.includes('.')) {
-              return senderEmail.endsWith('@' + tok) || senderEmail.endsWith('.' + tok);
-            }
-            return false;
-          });
+      list.innerHTML = '';
+      // Synchronous read from the scene-wide rules cache — caller
+      // (openNpcActionMenu) awaits loadRulesCache() before mounting
+      // this section so the cache is guaranteed to be ready here.
+      // No spinner, no post-mount mutation.
+      const rules = this.rulesCache || [];
+      const senderEmail = fromEmail.toLowerCase();
+      const matches = rules.filter(r => {
+        if (r.error) return false;
+        const from = (r.criteria?.from || '').toLowerCase().trim();
+        if (!from) return false;
+        const tokens = from.split(/[\s,]+|\bor\b/i).map((s: string) => s.trim()).filter(Boolean);
+        return tokens.some((tok: string) => {
+          if (tok === senderEmail) return true;
+          if (tok.startsWith('@')) return senderEmail.endsWith(tok);
+          if (!tok.includes('@') && tok.includes('.')) {
+            return senderEmail.endsWith('@' + tok) || senderEmail.endsWith('.' + tok);
+          }
+          return false;
         });
-        if (!matches.length) {
-          const empty = document.createElement('div');
-          empty.textContent = 'No matching rules.';
-          empty.style.cssText = 'color:#666; font-style:italic; font-size:12px; padding:2px 0;';
-          list.appendChild(empty);
-          return;
-        }
-        for (const r of matches) {
-          const row = document.createElement('div');
-          row.style.cssText = 'padding:6px 8px; background:#1a1a1a; border:1px solid #262626; border-radius:5px; display:flex; flex-direction:column; gap:2px;';
-          const acctLine = document.createElement('div');
-          acctLine.textContent = r.account;
-          acctLine.style.cssText = 'color:#888; font:10px ui-monospace,Consolas,monospace;';
-          const summary = document.createElement('div');
-          summary.textContent = `${summarizeRuleCriteria(r.criteria || {})} → ${summarizeRuleAction(r.action || {}, this.labelCache || [], r.account)}`;
-          summary.style.cssText = 'color:#ddd; font:12px ui-sans-serif,system-ui,sans-serif;';
-          row.appendChild(acctLine);
-          row.appendChild(summary);
-          list.appendChild(row);
-        }
-      }).catch(err => {
-        list.innerHTML = `<div style="color:#c66; font-size:12px;">Failed to load rules: ${escapeHtml(String(err))}</div>`;
       });
+      if (!matches.length) {
+        const empty = document.createElement('div');
+        empty.textContent = 'No matching rules.';
+        empty.style.cssText = 'color:#666; font-style:italic; font-size:12px; padding:2px 0;';
+        list.appendChild(empty);
+        return;
+      }
+      for (const r of matches) {
+        const row = document.createElement('div');
+        row.style.cssText = 'padding:6px 8px; background:#1a1a1a; border:1px solid #262626; border-radius:5px; display:flex; flex-direction:column; gap:2px;';
+        const acctLine = document.createElement('div');
+        acctLine.textContent = r.account;
+        acctLine.style.cssText = 'color:#888; font:10px ui-monospace,Consolas,monospace;';
+        const summary = document.createElement('div');
+        summary.textContent = `${summarizeRuleCriteria(r.criteria || {})} → ${summarizeRuleAction(r.action || {}, this.labelCache || [], r.account)}`;
+        summary.style.cssText = 'color:#ddd; font:12px ui-sans-serif,system-ui,sans-serif;';
+        row.appendChild(acctLine);
+        row.appendChild(summary);
+        list.appendChild(row);
+      }
     };
     renderRules();
     return wrap;

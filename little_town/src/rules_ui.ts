@@ -7,8 +7,21 @@
 // re-authenticated since the scope was added will surface as
 // `error: 'missing_scope'` entries in the list response.
 
-import { api, type AccountSummary, type GmailLabel } from './api';
+import { api, type AccountSummary, type GmailLabel, type EmailThread } from './api';
 import { clampPopupToViewport } from './ui_helpers';
+
+// Stale-match entry surfaced by the "Suggested moves" tab — an inbox
+// thread whose sender matches an existing rule but which hasn't had
+// the rule's target label applied yet (so the email predates the rule
+// or arrived while the user was offline). Computed by the host scene
+// via `findStaleMatches` because it requires access to the inbox
+// thread cache and the building↔label bindings.
+export interface StaleRuleMatch {
+  thread: EmailThread;
+  rule: { id?: string; rawId?: string; account: string; criteria?: any; action?: any };
+  targetLabel: string;          // resolved name of the rule's add-label
+  buildingName: string | null;  // building bound to that label (or a parent), if any
+}
 
 interface Criteria {
   from?: string;
@@ -42,6 +55,12 @@ export function openRulesPane(opts: {
   accounts: AccountSummary[];
   labels: GmailLabel[] | null;
   reauthUrl: (email: string) => string;
+  // Optional — when both are provided, the pane shows a "Suggested
+  // moves" tab that lists inbox threads whose sender matches an
+  // existing rule but the rule hasn't been applied to them yet.
+  // Useful for cleaning up email that arrived BEFORE a rule was made.
+  findStaleMatches?: () => Promise<StaleRuleMatch[]>;
+  applyRule?: (m: StaleRuleMatch) => Promise<void>;
 }): void {
   closeRulesPane();
   const overlay = document.createElement('div');
@@ -87,11 +106,55 @@ export function openRulesPane(opts: {
   title.appendChild(actions);
   card.appendChild(title);
 
-  // Body — list of rules grouped by account. The card's `1fr` track
-  // bounds this height, and `min-height:0` + `overflow-y:auto` lets it
-  // scroll when the rule sections overflow. The inner flex column gives
-  // each account section its natural height (no shrink) so they expand
-  // and the body scrolls instead of squishing rows.
+  // Two-view tab bar. "Rules" is the existing list of Gmail filters;
+  // "Suggested moves" surfaces inbox threads where a rule WOULD match
+  // but hasn't been applied yet (rule was created after the email
+  // arrived). Both views share the search input + new-rule button.
+  type View = 'rules' | 'suggested';
+  let currentView: View = 'rules';
+  const tabbar = document.createElement('div');
+  tabbar.style.cssText = 'background:#0e1218; padding:0 22px; display:flex; gap:0; flex:0 0 auto; border-bottom:1px solid #2a2a2a;';
+  const mkTab = (view: View, label: string): HTMLButtonElement => {
+    const t = document.createElement('button');
+    t.type = 'button';
+    t.textContent = label;
+    t.style.cssText = `
+      background:transparent; border:none; border-bottom:3px solid transparent;
+      color:#7a8b9f; padding:12px 18px; cursor:pointer;
+      font:600 13px ui-sans-serif,system-ui,sans-serif;
+    `;
+    t.addEventListener('click', () => {
+      if (currentView === view) return;
+      currentView = view;
+      restyleTabs();
+      render();
+    });
+    return t;
+  };
+  const tabRules = mkTab('rules', 'Rules');
+  const tabSuggested = opts.findStaleMatches && opts.applyRule
+    ? mkTab('suggested', '✨ Suggested moves')
+    : null;
+  const restyleTabs = () => {
+    for (const [el, view] of [[tabRules, 'rules'], [tabSuggested, 'suggested']] as Array<[HTMLButtonElement | null, View]>) {
+      if (!el) continue;
+      const active = currentView === view;
+      el.style.color = active ? '#d8b8ff' : '#7a8b9f';
+      el.style.borderBottomColor = active ? '#9c6cd6' : 'transparent';
+    }
+  };
+  tabbar.appendChild(tabRules);
+  if (tabSuggested) tabbar.appendChild(tabSuggested);
+  restyleTabs();
+  // The card's grid is `auto 1fr` (title + body). Adding the tab bar
+  // means we need three auto rows + one 1fr — rebuild the grid.
+  card.style.gridTemplateRows = 'auto auto 1fr';
+  card.appendChild(tabbar);
+
+  // Body — list of rules grouped by account, OR list of stale matches
+  // when the Suggested view is active. The card's `1fr` track bounds
+  // this height, and `min-height:0` + `overflow-y:auto` lets it scroll
+  // when sections overflow.
   const body = document.createElement('div');
   body.style.cssText = 'min-height:0; overflow-y:auto; padding:20px 24px; display:flex; flex-direction:column; gap:18px;';
   card.appendChild(body);
@@ -135,7 +198,27 @@ export function openRulesPane(opts: {
     return haystack.includes(q);
   };
 
-  const render = () => {
+  // Suggested-view state. Loaded on demand (first time the user opens
+  // that tab) and cached for the lifetime of the pane so toggling back
+  // doesn't re-scan; the "Refresh" link inside the view reloads.
+  let staleMatches: StaleRuleMatch[] | null = null;
+  let staleLoading = false;
+  const loadSuggested = () => {
+    if (!opts.findStaleMatches) return;
+    staleLoading = true;
+    render();
+    opts.findStaleMatches().then(list => {
+      staleMatches = list;
+      staleLoading = false;
+      render();
+    }).catch(err => {
+      staleLoading = false;
+      staleMatches = [];
+      body.innerHTML = `<div style="color:#c66; padding:8px 0;">Failed to scan inbox: ${escapeHtml(String(err))}</div>`;
+    });
+  };
+
+  const renderRulesView = () => {
     if (!allRules) {
       body.innerHTML = '<div style="color:#777; padding:8px 0;">Loading rules…</div>';
       return;
@@ -170,6 +253,77 @@ export function openRulesPane(opts: {
       none.style.cssText = 'color:#888; font-style:italic; padding:18px; text-align:center;';
       body.appendChild(none);
     }
+  };
+
+  const renderSuggestedView = () => {
+    body.innerHTML = '';
+    if (staleLoading) {
+      body.innerHTML = '<div style="color:#777; padding:8px 0;">Scanning inbox for stale rule matches…</div>';
+      return;
+    }
+    if (!staleMatches) {
+      // First time opening this view this session — kick off the scan.
+      loadSuggested();
+      return;
+    }
+    const q = searchInput.value.trim().toLowerCase();
+    const filtered = staleMatches.filter(m => {
+      if (!q) return true;
+      const hay = [
+        m.thread.from?.email, m.thread.from?.name, m.thread.subject, m.thread.snippet,
+        m.targetLabel, m.buildingName, m.rule.account,
+      ].filter(Boolean).join(' ').toLowerCase();
+      return hay.includes(q);
+    });
+    // Header bar: total + "Apply all" + "Refresh".
+    const header = document.createElement('div');
+    header.style.cssText = 'display:flex; align-items:center; gap:12px; padding:4px 0;';
+    const count = document.createElement('div');
+    count.textContent = filtered.length === staleMatches.length
+      ? `${filtered.length} stale match${filtered.length === 1 ? '' : 'es'}`
+      : `${filtered.length} of ${staleMatches.length}`;
+    count.style.cssText = 'color:#aaa; font:13px ui-sans-serif,system-ui,sans-serif; flex:1 1 auto;';
+    header.appendChild(count);
+    if (filtered.length) {
+      const applyAll = document.createElement('button');
+      applyAll.type = 'button';
+      applyAll.textContent = `Apply all ${filtered.length} →`;
+      applyAll.title = 'Run every visible rule against its matching thread';
+      applyAll.style.cssText = chipBtn('#3a2050', '#d8b8ff', '#5a3580');
+      applyAll.addEventListener('click', async () => {
+        if (applyAll.disabled) return;
+        applyAll.disabled = true; applyAll.style.opacity = '0.6';
+        applyAll.textContent = 'Applying…';
+        await Promise.all(filtered.map(m => opts.applyRule!(m).catch(err =>
+          console.warn(`[applyRule] failed for ${m.thread.threadId}:`, err))));
+        // Re-scan so the now-handled matches drop off the list.
+        loadSuggested();
+      });
+      header.appendChild(applyAll);
+    }
+    const refresh = document.createElement('button');
+    refresh.type = 'button';
+    refresh.textContent = '↻ Rescan';
+    refresh.title = 'Re-scan the inbox for stale rule matches';
+    refresh.style.cssText = chipBtn('#1a2030', '#9cf', '#2c4664');
+    refresh.addEventListener('click', () => loadSuggested());
+    header.appendChild(refresh);
+    body.appendChild(header);
+    if (!filtered.length) {
+      const none = document.createElement('div');
+      none.textContent = staleMatches.length
+        ? `No matches for "${searchInput.value}".`
+        : 'Nothing to clean up — every inbox thread that matches a rule already has the rule\'s label.';
+      none.style.cssText = 'color:#888; font-style:italic; padding:24px; text-align:center;';
+      body.appendChild(none);
+      return;
+    }
+    for (const m of filtered) body.appendChild(renderStaleMatchRow(m, opts, loadSuggested));
+  };
+
+  const render = () => {
+    if (currentView === 'suggested') renderSuggestedView();
+    else renderRulesView();
   };
   const loadList = () => {
     allRules = null;
@@ -699,6 +853,69 @@ export function openRuleEditor(opts: {
   overlay.addEventListener('mousedown', () => overlay.remove());
   document.body.appendChild(overlay);
   clampPopupToViewport(card);
+}
+
+// One row in the "Suggested moves" view. Shows sender + subject and
+// where the rule would file the email, with a one-click Apply button.
+// The apply is delegated to the host scene via opts.applyRule because
+// the move logic + NPC bookkeeping all live in main.ts.
+function renderStaleMatchRow(
+  m: StaleRuleMatch,
+  opts: { applyRule?: (m: StaleRuleMatch) => Promise<void> },
+  reload: () => void,
+): HTMLDivElement {
+  const row = document.createElement('div');
+  row.style.cssText = `
+    display:grid; grid-template-columns: 1fr auto; gap:10px;
+    align-items:center; padding:10px 14px;
+    background:#181818; border:1px solid #262626; border-radius:6px;
+  `;
+  const main = document.createElement('div');
+  main.style.cssText = 'min-width:0;';
+  const top = document.createElement('div');
+  top.style.cssText = 'display:flex; align-items:baseline; gap:8px; color:#fff; font:600 13px ui-sans-serif,system-ui,sans-serif;';
+  const sender = document.createElement('span');
+  sender.textContent = m.thread.from?.name || m.thread.from?.email || 'unknown';
+  sender.style.cssText = 'flex:0 1 auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;';
+  const senderEmail = document.createElement('span');
+  senderEmail.textContent = `<${m.thread.from?.email || ''}>`;
+  senderEmail.style.cssText = 'color:#7a8b9f; font:400 11px ui-monospace,Consolas,monospace; flex:0 1 auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;';
+  top.appendChild(sender); top.appendChild(senderEmail);
+  const subject = document.createElement('div');
+  subject.textContent = m.thread.subject || '(no subject)';
+  subject.style.cssText = 'color:#ddd; font:14px ui-sans-serif,system-ui,sans-serif; margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;';
+  const meta = document.createElement('div');
+  const buildingChip = m.buildingName
+    ? `<span style="background:#3a2e15; color:#e0c080; border:1px solid #6a5020; border-radius:10px; padding:1px 7px; font:600 11px ui-sans-serif,system-ui,sans-serif;">🏠 ${escapeHtml(m.buildingName)}</span>`
+    : `<span style="color:#888; font-style:italic;">(no building bound to ${escapeHtml(m.targetLabel)})</span>`;
+  meta.innerHTML = `<span style="color:#7a8b9f; font:12px ui-sans-serif,system-ui,sans-serif;">→ Apply <code style="color:#9cf;">${escapeHtml(m.targetLabel)}</code></span> ${buildingChip}
+                    <span style="color:#666; font:11px ui-monospace,Consolas,monospace; margin-left:8px;">${escapeHtml(m.rule.account)}</span>`;
+  meta.style.cssText = 'margin-top:4px; display:flex; align-items:center; gap:8px; flex-wrap:wrap;';
+  main.appendChild(top); main.appendChild(subject); main.appendChild(meta);
+  const apply = document.createElement('button');
+  apply.type = 'button';
+  apply.textContent = 'Apply →';
+  apply.style.cssText = chipBtn('#3a2050', '#d8b8ff', '#5a3580');
+  apply.addEventListener('click', async () => {
+    if (apply.disabled || !opts.applyRule) return;
+    apply.disabled = true;
+    apply.style.opacity = '0.6';
+    apply.textContent = 'Applying…';
+    try {
+      await opts.applyRule(m);
+      // Optimistically remove this row; reload will re-sync.
+      row.style.opacity = '0.4';
+      row.style.pointerEvents = 'none';
+      setTimeout(() => { row.remove(); reload(); }, 250);
+    } catch (err) {
+      apply.disabled = false; apply.style.opacity = '1';
+      apply.textContent = 'Apply →';
+      alert(`Apply failed: ${err}`);
+    }
+  });
+  row.appendChild(main);
+  row.appendChild(apply);
+  return row;
 }
 
 // ---- helpers ----

@@ -11,7 +11,7 @@ import { renderEmailListInto, applyReadStateToRow, destinationMatches, matchedFl
 import { openEmailContentPopup } from './email_content';
 import { aggregatePeople, threadsForPerson, saveOverride, characterForEmail } from './people';
 import { clampPopupToViewport } from './ui_helpers';
-import { openRulesPane, openRuleEditor, summarizeRuleCriteria, summarizeRuleAction } from './rules_ui';
+import { openRulesPane, openRuleEditor, summarizeRuleCriteria, summarizeRuleAction, type StaleRuleMatch } from './rules_ui';
 import { openPeopleGrid, openPersonPopup, openAvatarCustomizer } from './people_ui';
 import { avatarPortraitForEmail, ensureAvatar, randomAvatar, saveAvatar } from './avatar';
 import { composeAndRegisterAvatar, AVATAR_FRAMES } from './avatar_texture';
@@ -1049,6 +1049,8 @@ class VillageScene extends Phaser.Scene {
         accounts: this.currentAccounts,
         labels: this.labelCache,
         reauthUrl: (email: string) => api.reauthUrl(email),
+        findStaleMatches: () => this.findStaleRuleMatches(),
+        applyRule: (m) => this.applyStaleRuleMatch(m),
       });
     });
     // C — call the nearest NPC over and open their click-action popup.
@@ -2900,6 +2902,91 @@ class VillageScene extends Phaser.Scene {
       }
     }
     return out;
+  }
+
+  // Scan every cached inbox thread for senders whose existing rules
+  // WOULD have filed them but never did (typically: the rule was made
+  // after the email arrived). Used by the "Suggested moves" tab on
+  // the rules pane for quick batch cleanup.
+  //
+  // Returns per-thread/per-rule matches sorted with newest threads
+  // first. Bounded by what's actually in the cache — if the user's
+  // inbox is bigger than THREAD_LIMIT they'll need to refresh / scan
+  // to see deeper matches.
+  async findStaleRuleMatches(): Promise<StaleRuleMatch[]> {
+    if (!this.rulesCache) await this.loadRulesCache();
+    const rules = this.rulesCache || [];
+    const labels = this.labelCache || [];
+    const SYSTEM = new Set(['INBOX', 'SENT', 'DRAFT', 'SPAM', 'TRASH', 'UNREAD', 'STARRED', 'IMPORTANT']);
+    const inbox = this.emailCache.get('INBOX') || [];
+    const out: StaleRuleMatch[] = [];
+    // Pre-build building-by-label map so we resolve the destination
+    // building once per (account, labelName) instead of per match.
+    const buildingForLabel = (labelName: string): string | null => {
+      for (const b of this.buildings) {
+        const bound = getBuildingLabels(b);
+        if (bound.includes(labelName)) return b.name;
+        if (bound.some(n => labelName.startsWith(`${n}/`))) return b.name;
+      }
+      return null;
+    };
+    for (const t of inbox) {
+      const senderLower = (t.from?.email || '').toLowerCase();
+      if (!senderLower) continue;
+      for (const r of rules) {
+        if (r.error) continue;
+        if (r.account !== t.account) continue;
+        const from = (r.criteria?.from || '').toLowerCase().trim();
+        if (!from) continue;
+        const tokens = from.split(/[\s,]+|\bor\b/i).map((s: string) => s.trim()).filter(Boolean);
+        const senderMatches = tokens.some((tok: string) => {
+          if (tok === senderLower) return true;
+          if (tok.startsWith('@')) return senderLower.endsWith(tok);
+          if (!tok.includes('@') && tok.includes('.')) {
+            return senderLower.endsWith('@' + tok) || senderLower.endsWith('.' + tok);
+          }
+          return false;
+        });
+        if (!senderMatches) continue;
+        // First non-system add label is the rule's destination.
+        const adds: string[] = r.action?.addLabelIds || [];
+        const targetRawId = adds.find(id => !SYSTEM.has(id));
+        if (!targetRawId) continue;
+        // Already applied? Then it's not stale.
+        if (t.labels.includes(targetRawId)) continue;
+        const targetLabel = labels.find(l => l.account === r.account && l.rawId === targetRawId)?.name;
+        if (!targetLabel) continue;
+        out.push({
+          thread: t,
+          rule: r as any,
+          targetLabel,
+          buildingName: buildingForLabel(targetLabel),
+        });
+      }
+    }
+    // Newest threads first so the most urgent cleanup floats to the top.
+    out.sort((a, b) => new Date(b.thread.date).getTime() - new Date(a.thread.date).getTime());
+    return out;
+  }
+
+  // Apply one stale-rule match: file the inbox thread under the rule's
+  // add-label and remove INBOX. Same moveThread path the NPC popup
+  // uses, so all the badge / cache / popup-refresh side-effects are
+  // taken care of for free.
+  async applyStaleRuleMatch(m: StaleRuleMatch): Promise<void> {
+    // Find a building bound to the target label (preferred) so the
+    // user's world animation runs. If none, fall back to the label
+    // name itself — moveThread will look up a building bound to that
+    // exact name and abort cleanly if none exists.
+    const targetBuilding = this.buildings.find(b => {
+      const bound = getBuildingLabels(b);
+      return bound.includes(m.targetLabel) || bound.some(n => m.targetLabel.startsWith(`${n}/`));
+    });
+    const destLabelId = targetBuilding ? `building:${targetBuilding.id}` : m.targetLabel;
+    const destName = targetBuilding?.name || m.targetLabel;
+    // Override-label = the rule's target (so a rule that fires
+    // Hobbies/Patreon files to the floor, not the parent Hobbies).
+    return this.moveThread(m.thread.threadId, destLabelId, destName, m.targetLabel);
   }
 
   private computeMoveSuggestions(thread: EmailThread): Array<{ labelName: string; confidence: number; reason: string }> {

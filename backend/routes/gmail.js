@@ -326,13 +326,43 @@ router.get('/unread-count', requireAuth, async (req, res) => {
     const client = targets[account];
     if (!client) return;
     try {
-      const r = await getGmailClient(client).users.threads.list({
-        userId: 'me', maxResults: 1, q,
-        labelIds: [...rawIds, 'UNREAD'],
-      });
-      const c = r.data.resultSizeEstimate || 0;
-      breakdown[account] = c;
-      total += c;
+      // Prefer users.labels.get(labelId).threadsUnread — Gmail's own
+      // sidebar number, exact. Avoid users.threads.list's
+      // resultSizeEstimate, which is wildly inflated for label+UNREAD
+      // queries (often returns the total threads in the label, not
+      // just unread). When a q parameter is supplied OR the caller
+      // asked for multiple labels (intersection), fall back to
+      // threads.list because labels.get only knows one label at a time.
+      if (!q && rawIds.length === 1) {
+        const lbl = await getGmailClient(client).users.labels.get({ userId: 'me', id: rawIds[0] });
+        const c = lbl.data.threadsUnread || 0;
+        breakdown[account] = c;
+        total += c;
+      } else if (!q && rawIds.length === 0) {
+        // No label filter AND no q — count ALL unread.
+        const lbl = await getGmailClient(client).users.labels.get({ userId: 'me', id: 'UNREAD' });
+        const c = lbl.data.threadsUnread || 0;
+        breakdown[account] = c;
+        total += c;
+      } else {
+        // Multi-label intersection or text query: fall back to list
+        // pagination — count IDs to avoid the inflated estimate. Capped
+        // at 500 to keep this from being a quota nightmare.
+        let c = 0;
+        let pageToken;
+        for (let pages = 0; pages < 5; pages++) {
+          const r = await getGmailClient(client).users.threads.list({
+            userId: 'me', maxResults: 100, q,
+            labelIds: [...rawIds, 'UNREAD'],
+            pageToken,
+          });
+          c += (r.data.threads?.length || 0);
+          pageToken = r.data.nextPageToken;
+          if (!pageToken) break;
+        }
+        breakdown[account] = c;
+        total += c;
+      }
     } catch (err) {
       if (err.message?.includes('invalid_grant')) dropAccountForInvalidGrant(account);
       breakdown[account] = 0;

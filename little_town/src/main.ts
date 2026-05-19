@@ -793,8 +793,10 @@ class VillageScene extends Phaser.Scene {
     for (const b of this.buildings) {
       if (savedNames[b.id]) {
         b.name = savedNames[b.id];
-        b.label.setText(b.name);
       }
+      // Always render through the helper so the initial label uses the
+      // canonical "<name>" form even before NPCs spawn (count will be 0).
+      this.renderBuildingLabel(b);
     }
     const savedLabels = this.loadBuildingLabelMap();
     for (const b of this.buildings) {
@@ -3154,6 +3156,7 @@ class VillageScene extends Phaser.Scene {
       }
     }));
     console.log(`[npc-spawn] spawned ${this.npcs.length} person-NPCs across ${labelled.length} buildings`);
+    this.updateBuildingBadges();
   }
 
   // Spawn a single NPC for one sender at this building, carrying all
@@ -3357,8 +3360,12 @@ class VillageScene extends Phaser.Scene {
           // arrive home, queueWalk will append after this home walk.)
           npc.queueWalk(npc.homeDoor, undefined, homeLabel);
         }
+        this.updateBuildingBadges();
       }, destBuildingName);
     }
+    // Source building's count drops as soon as we strip the thread
+    // (the walk hasn't started, but the NPC no longer "carries" it).
+    this.updateBuildingBadges();
   }
 
   // List floor options (immediate-child sub-labels under any of the
@@ -3500,7 +3507,11 @@ class VillageScene extends Phaser.Scene {
       npc.destroy();
       const idx = this.npcs.indexOf(npc);
       if (idx >= 0) this.npcs.splice(idx, 1);
+      this.updateBuildingBadges();
     }, destBuildingName);
+    // Source building's count drops immediately — its NPC just stopped
+    // carrying any threads even though the walk is still in flight.
+    this.updateBuildingBadges();
   }
 
   // Teleport the player to the door associated with a building.
@@ -3525,9 +3536,37 @@ class VillageScene extends Phaser.Scene {
     const b = this.findBuilding(idOrName);
     if (!b) return undefined;
     b.name = newName;
-    b.label.setText(newName);
+    this.renderBuildingLabel(b);
     this.persistBuildingNameMap();
     return b;
+  }
+
+  // Render a building's floating world-label as "<name>  ·  <unread>"
+  // when the building has any NPCs carrying unread threads, else just
+  // the name. Counts come from the live NPC list (homeBuildingId +
+  // threadIds.length) so the badge reflects exactly what's on the map
+  // — drops the moment an NPC walks off, climbs the moment they spawn.
+  private renderBuildingLabel(b: Building): void {
+    const c = this.unreadCountForBuilding(b);
+    b.label.setText(c > 0 ? `${b.name}  ·  ${c}` : b.name);
+  }
+
+  private unreadCountForBuilding(b: Building): number {
+    let n = 0;
+    for (const npc of this.npcs) {
+      const data = npc.data as any;
+      if (data?.homeBuildingId !== b.id) continue;
+      const tids = (data.threadIds as string[] | undefined) || [];
+      n += tids.length;
+    }
+    return n;
+  }
+
+  // Recompute every building's label. Cheap (one O(npcs) scan + one
+  // setText per building) and idempotent — safe to call from any code
+  // path that changes NPC threads or spawns/destroys NPCs.
+  private updateBuildingBadges(): void {
+    for (const b of this.buildings) this.renderBuildingLabel(b);
   }
   setBuildingDescription(idOrName: number | string, newDesc: string): Building | undefined {
     const b = this.findBuilding(idOrName);

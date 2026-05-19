@@ -178,7 +178,14 @@ export class NPC {
   // `label` is shown in the NPC popup as "Going to: <label>".
   queueWalk(door: Door, onArrive?: () => void, label?: string): void {
     this.walkQueue.push({ door, onArrive, label });
-    if (!this.targetDoor && !this.path.length) {
+    // Start immediately whenever the NPC isn't already heading to an
+    // explicit target. A wander path (no targetDoor, but path.length > 0)
+    // counts as preemptable — the user just told this NPC where to go,
+    // so abandon the random ambient walk and head there now. Without
+    // this, queueWalk silently queues behind the wander and the wander-
+    // completion code in update() never advances the queue, leaving the
+    // NPC stuck at home with 0 unread after a Move-all.
+    if (!this.targetDoor) {
       this.advanceQueue();
     }
   }
@@ -432,12 +439,19 @@ export class NPC {
     if (dist < ARRIVE_PX) {
       this.pathIdx++;
       this.stallMs = 0;
-      // Reached final waypoint? Set idle and stop.
+      // Reached final waypoint? Set idle and stop. (Or, if something
+      // was queued while we wandered, advance to it now instead of
+      // idling — defensive: queueWalk already preempts wander, but
+      // this catches anything that slipped through.)
       if (this.pathIdx >= this.path.length && !this.targetDoor) {
         this.path = [];
-        this.idleUntilMs = now + this.randomIdleMs();
         this.sprite.setVelocity(0);
         this.sprite.anims.stop();
+        if (this.walkQueue.length > 0) {
+          this.advanceQueue();
+        } else {
+          this.idleUntilMs = now + this.randomIdleMs();
+        }
       }
       this.lastX = this.sprite.x; this.lastY = this.sprite.y;
       return;

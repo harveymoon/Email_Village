@@ -1822,7 +1822,22 @@ class VillageScene extends Phaser.Scene {
   //      "borrowing" some far-away building's door.
   // Logs a console warning whenever a fallback fires so the user
   // knows to add a door inside that building in Tiled.
+  // Per-building door cache. The synth path runs searchWalkableSouthFirst
+  // which scans a tile ring — fine once, wasteful when called inside a
+  // bulk move loop (formerly: N threads × one call each = N redundant
+  // scans + N "[door] synth…" log lines). Result is invariant for the
+  // session because doors / building rects don't change at runtime.
+  private doorCache = new Map<number, Door | null>();
+
   private findDoorForBuilding(b: Building): Door | null {
+    const cached = this.doorCache.get(b.id);
+    if (cached !== undefined) return cached;
+    const result = this.computeDoorForBuilding(b);
+    this.doorCache.set(b.id, result);
+    return result;
+  }
+
+  private computeDoorForBuilding(b: Building): Door | null {
     const TILE = 48;
     if (!this.grid) return null;
     // 1. Walkable door INSIDE the rect — best case.
@@ -1850,8 +1865,11 @@ class VillageScene extends Phaser.Scene {
     const hintTy = hint ? hint.ty : ((b.y + b.h / 2) / TILE | 0);
     const found = this.searchWalkableSouthFirst(hintTx, hintTy);
     if (found) {
+      // Synth-from-pin / synth-from-rect-centre is the normal fallback
+      // when no explicit Door object is in the Doors layer. Logging at
+      // info level (debug-style) so bulk moves don't spam.
       const reason = hint ? `pin at (${hint.tx},${hint.ty})` : `rect centre`;
-      console.warn(`[door] "${b.name}" — synth from ${reason} → walkable (${found.tx},${found.ty})`);
+      console.debug(`[door] "${b.name}" — synth from ${reason} → walkable (${found.tx},${found.ty})`);
       return { x: found.tx * TILE + TILE / 2, y: found.ty * TILE + TILE / 2, tx: found.tx, ty: found.ty };
     }
     // 3. Fall back to the building's bottom edge center, searching
@@ -2224,10 +2242,14 @@ class VillageScene extends Phaser.Scene {
         return this.destinationsForMove(accounts, threads[0]);
       },
       onMoveAll: async (threads, destLabelId, destBuilding, overrideLabel) => {
-        for (const t of threads) {
-          try { await this.moveThread(t.threadId, destLabelId, destBuilding, overrideLabel); }
-          catch (err) { console.warn(`[moveAll-person] ${t.threadId}:`, err); }
-        }
+        // Fire moves in parallel — each one is mostly waiting on its
+        // own Gmail API round trip, and they don't depend on each
+        // other. Was serial-await before, which scaled linearly with
+        // thread count and felt sluggish for 20+ at a time.
+        await Promise.all(threads.map(t =>
+          this.moveThread(t.threadId, destLabelId, destBuilding, overrideLabel)
+            .catch(err => console.warn(`[moveAll-person] ${t.threadId}:`, err))
+        ));
       },
       onMarkAllRead: async (threads) => {
         for (const t of threads) {

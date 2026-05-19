@@ -4483,6 +4483,14 @@ class VillageScene extends Phaser.Scene {
       }
     }
     for (const npc of this.npcs) npc.update();
+    // Y-sort the character sprites so the one closer to the camera
+    // (lower on screen = higher y) draws on top. Buildings layer
+    // (depth 15) and trees (depth 10) stay below — every character's
+    // depth ends up ≥ ~30, far above both. Using sprite.y directly
+    // sorts by sprite center; with same-height LimeZu 48x96 sprites
+    // that's indistinguishable from sorting by feet position.
+    if (player) player.setDepth(player.y);
+    for (const npc of this.npcs) npc.sprite.setDepth(npc.sprite.y);
     if (this.showPaths) this.drawNpcPaths();
     this.updateNearestNpcArrow();
     this.updateRegionBanner();

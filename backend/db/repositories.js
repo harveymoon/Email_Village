@@ -141,6 +141,7 @@ const threadsStmts = {
   removeOneLabel: db.prepare(`DELETE FROM thread_labels WHERE thread_id = ? AND raw_id = ?`),
   insertLabel: db.prepare(`INSERT OR IGNORE INTO thread_labels(thread_id, raw_id) VALUES (?, ?)`),
   getById: db.prepare(`SELECT * FROM threads WHERE id = ?`),
+  existsById: db.prepare(`SELECT 1 AS n FROM threads WHERE id = ?`),
   count: db.prepare(`SELECT COUNT(*) AS n FROM threads`),
   countForAccount: db.prepare(`SELECT COUNT(*) AS n FROM threads WHERE account = ?`),
   labelsOf: db.prepare(`SELECT raw_id FROM thread_labels WHERE thread_id = ?`),
@@ -190,6 +191,7 @@ export const threadsRepo = {
     threadsStmts.remove.run(threadId);
   }),
   getById: (id) => threadsStmts.getById.get(id),
+  existsById: (id) => !!threadsStmts.existsById.get(id),
   labelsOf: (id) => threadsStmts.labelsOf.all(id).map(r => r.raw_id),
   count: () => threadsStmts.count.get().n,
   countForAccount: (account) => threadsStmts.countForAccount.get(account).n,

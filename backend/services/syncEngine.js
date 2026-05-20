@@ -39,9 +39,18 @@ export async function backfillAccount(email, client) {
     // If a previous run completed the count (done >= total) but
     // crashed before marking last_full_sync_at, treat that as done
     // and skip the full re-walk. Saves ~25min on a 69k-thread inbox.
+    //
+    // We also use the actual on-disk thread count as a lower bound on
+    // "done" — `backfill_done` gets reset to 0 by markBackfillStart on
+    // every relaunch even when the threads table already holds the
+    // results of past runs. Without this floor, the second launch
+    // after a successful first run would mis-detect us as having made
+    // zero progress.
     const existing = accountsRepo.get(email);
-    if (existing?.backfill_total && existing.backfill_done >= existing.backfill_total) {
-      console.log(`[sync] ${email}: previous backfill reached ${existing.backfill_done}/${existing.backfill_total}, finalising`);
+    const existingThreadCount = threadsRepo.countForAccount(email);
+    const effectiveDone = Math.max(existing?.backfill_done || 0, existingThreadCount);
+    if (existing?.backfill_total && effectiveDone >= existing.backfill_total) {
+      console.log(`[sync] ${email}: previous backfill reached ${effectiveDone}/${existing.backfill_total} (${existingThreadCount.toLocaleString()} on disk), finalising`);
       try {
         await gmailLimiter.take(1);
         const prof = await g.users.getProfile({ userId: 'me' });
@@ -53,7 +62,15 @@ export async function backfillAccount(email, client) {
         // Fall through to a full backfill below.
       }
     }
-    console.log(`[sync] backfill start: ${email}`);
+    // We already have `existingThreadCount` from the short-circuit
+    // check above. After a partial backfill the threads table keeps
+    // every row even though `backfill_done` gets reset to 0 by
+    // markBackfillStart below. Re-fetching threads we have wastes
+    // Gmail quota AND makes the progress meter read "0/69258" when
+    // really we have most of them. Seed backfill_done with the
+    // existing count and skip the threads.get call for any id we
+    // already have on disk.
+    console.log(`[sync] backfill start: ${email} (${existingThreadCount.toLocaleString()} threads already in local store)`);
 
     // Capture a baseline historyId BEFORE we list anything. Using the
     // post-backfill historyId could skip changes that happen during the
@@ -66,6 +83,11 @@ export async function backfillAccount(email, client) {
       const prof = await g.users.getProfile({ userId: 'me' });
       baselineHistoryId = prof.data.historyId;
       accountsRepo.markBackfillStart(email, prof.data.threadsTotal);
+      // Seed backfill_done with the threads already on disk so the
+      // progress meter starts at the right place and the "previous
+      // backfill reached done >= total" short-circuit on next launch
+      // has accurate input.
+      if (existingThreadCount > 0) accountsRepo.bumpBackfillDone(email, existingThreadCount);
     } catch (err) {
       console.warn(`[sync] ${email}: getProfile failed during backfill init:`, err.message);
     }
@@ -119,8 +141,18 @@ export async function backfillAccount(email, client) {
           return false;
         }
       }
-      const threadIds = (listResp.data.threads || []).map(t => t.id);
+      const allThreadIds = (listResp.data.threads || []).map(t => t.id);
       pageToken = listResp.data.nextPageToken;
+      // Drop ids we already have — saves a metadata.get round-trip (~5
+      // quota units) per skipped thread. After a partial backfill this
+      // can be most of a page; on a true fresh start it's none of them.
+      // History sync covers any subsequent updates so we don't need to
+      // re-fetch metadata to catch later changes.
+      const threadIds = allThreadIds.filter(id => !threadsRepo.existsById(`${email}:${id}`));
+      const skipped = allThreadIds.length - threadIds.length;
+      if (skipped > 0) {
+        console.log(`[sync] ${email}: skipped ${skipped}/${allThreadIds.length} already in local store on page ${pagesDone + 1}`);
+      }
 
       // 3. Batch threads.get with format='metadata'. On rate-limit
       //    failures (429 / "Quota exceeded"), pause progressively

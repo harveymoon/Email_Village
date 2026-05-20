@@ -155,16 +155,34 @@ export function setStatus(msg: string, opts: { ttlMs?: number; tone?: 'info' | '
   }
 }
 
+// State tracking so the backend-down banner doesn't flicker every 2s
+// when the backend is genuinely unreachable. First failure: show
+// "Backend not reachable". Subsequent failures don't touch the DOM
+// (the message stays put). First success after a run of failures:
+// log + re-render normally.
+let consecutiveFailures = 0;
+
 async function pollOnce(): Promise<void> {
   try {
     const r = await fetch(`${API_BASE}/api/sync-status`);
     if (!r.ok) return;
     const status = (await r.json()) as SyncStatus;
+    if (consecutiveFailures > 0) {
+      console.log(`[status] backend recovered after ${consecutiveFailures} failed polls`);
+      consecutiveFailures = 0;
+    }
     renderBackfillState(status);
   } catch {
-    // Backend probably down — show that on the LEFT so it's obvious.
-    if (leftEl) leftEl.innerHTML = `<span style="color:#f08080;">⚠ Backend not reachable</span>`;
-    if (progressFillEl) { progressFillEl.style.width = '0%'; progressFillEl.style.opacity = '0'; }
+    consecutiveFailures++;
+    if (consecutiveFailures === 1) {
+      // First failure — show the banner once + log noisily so we have
+      // something in the renderer console if the user reports it.
+      if (leftEl) leftEl.innerHTML = `<span style="color:#f08080;">⚠ Backend not reachable · retrying every ${POLL_MS / 1000}s</span>`;
+      if (progressFillEl) { progressFillEl.style.width = '0%'; progressFillEl.style.opacity = '0'; }
+      console.warn('[status] backend unreachable; subsequent failures suppressed until recovery');
+    }
+    // Subsequent failures: no DOM mutation. The banner stays put,
+    // doesn't flicker.
   }
 }
 

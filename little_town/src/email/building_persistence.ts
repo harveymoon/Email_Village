@@ -27,6 +27,13 @@ type BindingMap = Record<string, { customName: string | null; labels: string[] }
 // the bundle-level bootstrap promise resolves.
 let bindings: BindingMap = {};
 
+// Concurrent-fetch guard. loadBuildingBindings() is called once at
+// bundle bootstrap AND every account switch — if both fire close
+// together (e.g. account switch happens during the bootstrap fetch),
+// the second caller waits on the first instead of starting a parallel
+// request that would race to write the same `bindings` map.
+let loadingPromise: Promise<BindingMap> | null = null;
+
 const LEGACY_LABELS_V2_KEY = 'little_town.building_labels_v2';
 const LEGACY_LABELS_V1_KEY = 'little_town.building_labels';     // v1 stored a single name, not array
 const LEGACY_NAMES_KEY     = 'little_town.building_names';
@@ -69,32 +76,39 @@ function clearLegacyLocalStorageKeys(): void {
 /**
  * Bundle-bootstrap hook. Fetches /api/buildings; if empty, migrates
  * legacy localStorage keys (one-shot, with cleanup). Resolves to the
- * in-memory bindings map.
+ * in-memory bindings map. Concurrent calls share one in-flight fetch.
  */
 export async function loadBuildingBindings(): Promise<BindingMap> {
-  try {
-    const fromApi = await api.buildings.list();
-    if (Object.keys(fromApi).length > 0) {
-      bindings = fromApi as BindingMap;
+  if (loadingPromise) return loadingPromise;
+  loadingPromise = (async () => {
+    try {
+      const fromApi = await api.buildings.list();
+      if (Object.keys(fromApi).length > 0) {
+        bindings = fromApi as BindingMap;
+        return bindings;
+      }
+      // SQLite empty — try legacy localStorage migration.
+      const legacy = readLegacyFromLocalStorage();
+      if (Object.keys(legacy).length === 0) {
+        bindings = {};
+        return bindings;
+      }
+      bindings = legacy;
+      await Promise.all(Object.entries(legacy).map(([id, b]) =>
+        api.buildings.put(id, b).catch(err => console.warn(`[buildings] migrate ${id} failed:`, err))));
+      console.log(`[bootstrap] migrated ${Object.keys(legacy).length} building bindings from localStorage to SQLite`);
+      clearLegacyLocalStorageKeys();
       return bindings;
-    }
-    // SQLite empty — try legacy localStorage migration.
-    const legacy = readLegacyFromLocalStorage();
-    if (Object.keys(legacy).length === 0) {
-      bindings = {};
+    } catch (err) {
+      console.warn('[buildings] API hydrate failed, falling back to legacy localStorage:', err);
+      bindings = readLegacyFromLocalStorage();
       return bindings;
+    } finally {
+      // Clear the flag so a future account change can re-load.
+      loadingPromise = null;
     }
-    bindings = legacy;
-    await Promise.all(Object.entries(legacy).map(([id, b]) =>
-      api.buildings.put(id, b).catch(err => console.warn(`[buildings] migrate ${id} failed:`, err))));
-    console.log(`[bootstrap] migrated ${Object.keys(legacy).length} building bindings from localStorage to SQLite`);
-    clearLegacyLocalStorageKeys();
-    return bindings;
-  } catch (err) {
-    console.warn('[buildings] API hydrate failed, falling back to legacy localStorage:', err);
-    bindings = readLegacyFromLocalStorage();
-    return bindings;
-  }
+  })();
+  return loadingPromise;
 }
 
 /** Synchronous reader — building ids → bound label name arrays. Skips entries with empty labels. */
@@ -132,4 +146,5 @@ export function persistBuilding(buildingId: number, customName: string | null, l
 /** Wipe in-memory cache. Used on account switch so cross-account state can't leak. */
 export function resetBuildingBindingsForAccountChange(): void {
   bindings = {};
+  loadingPromise = null;     // allow loadBuildingBindings() to re-run for the new account
 }

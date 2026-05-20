@@ -197,9 +197,18 @@ export function openInboxTriage(deps: TriageDeps): void {
     const actions = document.createElement('div');
     actions.style.cssText = 'display:flex; flex-direction:column; gap:6px; align-items:flex-end;';
 
-    // Move all — opens destination picker
+    // Move all — opens destination picker. Button text shows the exact
+    // destination so a floor-targeted suggestion (e.g. "Financial/Robinhood"
+    // inside the "bank account investing crypto" building) is visible at a
+    // glance — not hidden behind the parent building name.
+    const suggestedLabel = suggested?.suggestion?.label;
+    const movesToFloor = !!(suggestedLabel && suggestedLabel.includes('/'));
     const moveBtn = pillButton(
-      suggested ? `Move all → ${suggested.buildingName}` : `Move all →`,
+      suggested
+        ? movesToFloor
+          ? `Move all → ${suggestedLabel}`
+          : `Move all → ${suggested.buildingName}`
+        : `Move all →`,
       '#3a2050', '#d8b8ff', '#5a3580',
     );
     moveBtn.addEventListener('click', async () => {

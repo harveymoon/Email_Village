@@ -11,6 +11,7 @@
 import express from 'express';
 import { google } from 'googleapis';
 import { requireAuth, dropAccountForInvalidGrant } from './auth.js';
+import { parseMessage, extractUnsubscribe } from '../gmail/parseMessage.js';
 
 const router = express.Router();
 
@@ -66,109 +67,9 @@ function handleGmailError(err, res, action, account) {
   });
 }
 
-// Parse a Gmail message into the same flat shape we used in single-account
-// mode, with id/threadId prefixed by `account:`.
-function parseMessage(account, message) {
-  const headers = message.payload?.headers || [];
-  const getHeader = (name) => headers.find(h => h.name.toLowerCase() === name.toLowerCase())?.value || '';
-
-  let body = '', bodyHtml = '';
-  const snippet = message.snippet || '';
-
-  const findParts = (payload) => {
-    const out = { text: null, html: null };
-    if (payload.mimeType === 'text/plain' && payload.body?.data) {
-      out.text = Buffer.from(payload.body.data, 'base64').toString('utf-8');
-    } else if (payload.mimeType === 'text/html' && payload.body?.data) {
-      out.html = Buffer.from(payload.body.data, 'base64').toString('utf-8');
-    } else if (payload.parts) {
-      for (const part of payload.parts) {
-        const r = findParts(part);
-        if (r.text) out.text = r.text;
-        if (r.html) out.html = r.html;
-      }
-    }
-    return out;
-  };
-
-  if (message.payload) {
-    if (message.payload.body?.data) {
-      const content = Buffer.from(message.payload.body.data, 'base64').toString('utf-8');
-      if (message.payload.mimeType === 'text/html') bodyHtml = content;
-      else body = content;
-    } else if (message.payload.parts) {
-      const p = findParts(message.payload);
-      body = p.text || ''; bodyHtml = p.html || '';
-    }
-  }
-
-  const fromHeader = getHeader('From');
-  const fromMatch = fromHeader.match(/^(.+?)\s*<(.+?)>$/) || [null, fromHeader, fromHeader];
-  const hasAttachment = message.payload?.parts?.some(p => p.filename && p.filename.length > 0) || false;
-
-  return {
-    id: `${account}:${message.id}`,
-    threadId: `${account}:${message.threadId}`,
-    account,
-    from: {
-      name: fromMatch[1]?.replace(/"/g, '').trim() || fromMatch[2],
-      email: fromMatch[2] || fromHeader,
-      avatar: null,
-    },
-    to: getHeader('To'),
-    subject: getHeader('Subject') || '(no subject)',
-    snippet,
-    body,
-    bodyHtml,
-    date: getHeader('Date'),
-    labels: message.labelIds || [],
-    isRead: !message.labelIds?.includes('UNREAD'),
-    isStarred: message.labelIds?.includes('STARRED'),
-    hasAttachment,
-    unsubscribe: extractUnsubscribe(getHeader('List-Unsubscribe'), getHeader('List-Unsubscribe-Post'), bodyHtml),
-  };
-}
-
-// Pull unsubscribe metadata out of the RFC 2369 List-Unsubscribe +
-// RFC 8058 List-Unsubscribe-Post headers, with a body-scan fallback
-// for senders that only embed an unsubscribe link in the HTML footer.
-//
-// Returns null when nothing is found. Otherwise:
-//   { http?: string,    // first https/http URL we saw
-//     mailto?: string,  // first mailto: address we saw
-//     oneClick: boolean,// RFC 8058 — server may POST to http with no UI
-//     source: 'header' | 'body' }
-//
-// The frontend renders an "Unsubscribe" button whenever this is non-
-// null; the backend /unsubscribe endpoint decides what to actually do
-// (POST for one-click, send mailto, or hand the URL back so the
-// browser can open it in a new tab).
-function extractUnsubscribe(listHeader, postHeader, html) {
-  const out = { oneClick: false, source: 'header' };
-  if (listHeader) {
-    // Header looks like `<mailto:foo@bar>, <https://baz/quux>` —
-    // multiple `<...>` values separated by commas. Pick the first
-    // mailto and the first http(s) we see.
-    const matches = listHeader.match(/<([^>]+)>/g) || [];
-    for (const raw of matches) {
-      const v = raw.slice(1, -1).trim();
-      if (!out.mailto && v.toLowerCase().startsWith('mailto:')) out.mailto = v.slice(7);
-      else if (!out.http && /^https?:/i.test(v)) out.http = v;
-    }
-    if (postHeader && /one-click/i.test(postHeader)) out.oneClick = true;
-    if (out.mailto || out.http) return out;
-  }
-  // Fallback: scrape the HTML body for an unsubscribe-looking link.
-  // Cheap regex — we accept some false positives because the worst case
-  // is a button that opens a wrong page in a new tab.
-  if (html) {
-    const m = html.match(/href\s*=\s*["']([^"']*unsubscrib[^"']*)["']/i);
-    if (m && /^https?:/i.test(m[1])) {
-      return { http: m[1], oneClick: false, source: 'body' };
-    }
-  }
-  return null;
-}
+// parseMessage + extractUnsubscribe live in backend/gmail/parseMessage.js
+// so the sync engine and these legacy routes share one implementation.
+// See the import at the top.
 
 // ---------------- profile (multi) ----------------
 router.get('/profile', requireAuth, async (req, res) => {

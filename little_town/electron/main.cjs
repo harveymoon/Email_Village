@@ -69,6 +69,11 @@ function startBackend() {
       ...process.env,
       ELECTRON_RUN_AS_NODE: '1',
       PORT: String(BACKEND_PORT),
+      // Backend's SQLite DB lives under Electron's per-user data dir
+      // so packaged installs don't pollute the repo / cwd. The default
+      // (~/.town-inbox) is the dev fallback used when running the
+      // backend standalone (npm run dev).
+      TOWN_INBOX_DATA_DIR: app.getPath('userData'),
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });

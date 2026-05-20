@@ -252,6 +252,146 @@ export const messagesRepo = {
   forThread: (threadId) => messagesStmts.forThread.all(threadId),
 };
 
+// ---------- list/aggregate queries (read-side) ----------
+//
+// All return rows shaped as close as possible to what the legacy
+// /api/emails endpoint returned, so the renderer keeps working without
+// changes. Body fields stay empty in list views — the renderer fetches
+// bodies via /api/threads/:id only when the user actually opens a
+// thread, which triggers the lazy body fetch in routes/gmail.js.
+
+const listStmts = {
+  // Threads carrying ANY label whose name matches (exact or "<name>/..."
+  // prefix). Returns one row per thread; aggregates labels via GROUP_CONCAT.
+  // ORDER BY date DESC matches Gmail's default newest-first.
+  byLabelName: db.prepare(`
+    SELECT DISTINCT t.*,
+                    (SELECT GROUP_CONCAT(raw_id) FROM thread_labels WHERE thread_id = t.id) AS labels_concat
+      FROM threads t
+      JOIN thread_labels tl ON tl.thread_id = t.id
+      JOIN labels l         ON l.account = t.account AND l.raw_id = tl.raw_id
+     WHERE l.name = ? OR l.name LIKE ? || '/%'
+     ORDER BY t.date DESC
+     LIMIT ? OFFSET ?
+  `),
+  bySender: db.prepare(`
+    SELECT t.*,
+           (SELECT GROUP_CONCAT(raw_id) FROM thread_labels WHERE thread_id = t.id) AS labels_concat
+      FROM threads t
+     WHERE t.from_email = LOWER(?)
+     ORDER BY t.date DESC
+     LIMIT ? OFFSET ?
+  `),
+  allRecent: db.prepare(`
+    SELECT t.*,
+           (SELECT GROUP_CONCAT(raw_id) FROM thread_labels WHERE thread_id = t.id) AS labels_concat
+      FROM threads t
+     ORDER BY t.date DESC
+     LIMIT ? OFFSET ?
+  `),
+  unreadCountByLabel: db.prepare(`
+    SELECT COUNT(DISTINCT t.id) AS n
+      FROM threads t
+      JOIN thread_labels tl ON tl.thread_id = t.id
+      JOIN labels l         ON l.account = t.account AND l.raw_id = tl.raw_id
+     WHERE (l.name = @name OR l.name LIKE @name || '/%')
+       AND t.is_read = 0
+  `),
+  unreadCountBySystemLabel: db.prepare(`
+    SELECT COUNT(*) AS n
+      FROM threads t
+      JOIN thread_labels tl ON tl.thread_id = t.id
+     WHERE tl.raw_id = ?
+       AND t.is_read = 0
+  `),
+  unreadCountAll: db.prepare(`SELECT COUNT(*) AS n FROM threads WHERE is_read = 0`),
+  // Per-sender aggregate for the People grid. Counts only consider
+  // visible threads (anything in our DB), grouped by lowercased sender.
+  peopleAggregate: db.prepare(`
+    SELECT from_email AS email,
+           MAX(from_name) AS name,
+           COUNT(*) AS total,
+           SUM(CASE WHEN is_read = 0 THEN 1 ELSE 0 END) AS unread,
+           MAX(date) AS latest_date
+      FROM threads
+     WHERE from_email IS NOT NULL AND from_email <> ''
+     GROUP BY from_email
+     ORDER BY unread DESC, total DESC
+  `),
+};
+
+// Helper: hydrate `labels_concat` into a real array, and attach a
+// messages array (metadata-only) so the response shape matches the
+// legacy parseMessage output. Body fields stay empty in list mode.
+function hydrateThread(row) {
+  if (!row) return null;
+  const messages = messagesStmts.forThread.all(row.id).map(m => ({
+    id: m.id,
+    threadId: m.thread_id,
+    account: m.account,
+    from: { name: m.from_name, email: m.from_email, avatar: null },
+    to: m.to_header || '',
+    subject: row.subject || '',
+    snippet: m.snippet || '',
+    body: m.body || '',
+    bodyHtml: m.body_html || '',
+    date: m.date ? new Date(m.date).toISOString() : '',
+    labels: [],                  // per-message labels not tracked separately — see thread.labels
+    isRead: !!m.is_read,
+    isStarred: !!row.is_starred,
+    hasAttachment: !!m.has_attachment,
+    unsubscribe: m.unsubscribe_json ? JSON.parse(m.unsubscribe_json) : null,
+  }));
+  return {
+    id: row.id,
+    threadId: row.id,
+    account: row.account,
+    messageCount: row.message_count,
+    from: { name: row.from_name, email: row.from_email, avatar: null },
+    to: messages[messages.length - 1]?.to || '',
+    subject: row.subject || '(no subject)',
+    snippet: row.snippet || '',
+    date: row.date ? new Date(row.date).toISOString() : '',
+    labels: (row.labels_concat || '').split(',').filter(Boolean),
+    isRead: !!row.is_read,
+    isStarred: !!row.is_starred,
+    hasAttachment: !!row.has_attachment,
+    messages,
+    originalFrom: messages[0]?.from || { name: row.from_name, email: row.from_email, avatar: null },
+    unsubscribe: row.unsubscribe_json ? JSON.parse(row.unsubscribe_json) : null,
+  };
+}
+
+export const queryRepo = {
+  threadsByLabelName(name, { limit = 1000, offset = 0 } = {}) {
+    return listStmts.byLabelName.all(name, name, limit, offset).map(hydrateThread);
+  },
+  threadsBySender(email, { limit = 5000, offset = 0 } = {}) {
+    return listStmts.bySender.all(email, limit, offset).map(hydrateThread);
+  },
+  recentThreads({ limit = 200, offset = 0 } = {}) {
+    return listStmts.allRecent.all(limit, offset).map(hydrateThread);
+  },
+  fullThread(id) {
+    const row = threadsStmts.getById.get(id);
+    if (!row) return null;
+    row.labels_concat = threadsRepo.labelsOf(id).join(',');
+    return hydrateThread(row);
+  },
+  unreadCountByLabelName(name) {
+    return listStmts.unreadCountByLabel.get({ name })?.n ?? 0;
+  },
+  unreadCountBySystemRawId(rawId) {
+    return listStmts.unreadCountBySystemLabel.get(rawId)?.n ?? 0;
+  },
+  unreadCountAll() {
+    return listStmts.unreadCountAll.get()?.n ?? 0;
+  },
+  peopleAggregate() {
+    return listStmts.peopleAggregate.all();
+  },
+};
+
 // ---------- mutation_queue ----------
 const queueStmts = {
   enqueueModify: db.prepare(`

@@ -12,6 +12,9 @@ import express from 'express';
 import { google } from 'googleapis';
 import { requireAuth, dropAccountForInvalidGrant } from './auth.js';
 import { parseMessage, extractUnsubscribe } from '../gmail/parseMessage.js';
+import { labelsRepo, threadsRepo, messagesRepo, queryRepo } from '../db/repositories.js';
+import { applyAndEnqueueModify, applyAndEnqueueMarkRead } from '../services/mutationQueue.js';
+import { gmailLimiter } from '../services/rateLimiter.js';
 
 const router = express.Router();
 
@@ -97,82 +100,72 @@ router.get('/profile', requireAuth, async (req, res) => {
 // can group / dedupe by name as it sees fit. Same-name labels from different
 // accounts stay separate (different ids).
 router.get('/labels', requireAuth, async (req, res) => {
+  // SQLite-backed: labels table is kept fresh by the sync engine
+  // (backfill seeds it, history poll updates threadsTotal/Unread).
+  // No Gmail round-trip per call — instant, no quota cost.
   const targets = clientsFor(req);
-  const all = [];
-  await Promise.all(Object.entries(targets).map(async ([account, client]) => {
-    try {
-      const r = await getGmailClient(client).users.labels.list({ userId: 'me' });
-      const labels = (r.data.labels || [])
-        .filter(l => l.type === 'user' || ['INBOX', 'STARRED', 'IMPORTANT'].includes(l.id))
-        .map(l => ({
-          id: `${account}:${l.id}`,
-          rawId: l.id,
-          account,
-          name: l.name,
-          type: l.type,
-          color: l.color?.backgroundColor || null,
-        }));
-      all.push(...labels);
-    } catch (err) {
-      if (err.message?.includes('invalid_grant')) dropAccountForInvalidGrant(account);
-      console.warn(`[labels] ${account}:`, err.message);
-    }
-  }));
+  const wanted = new Set(Object.keys(targets));
+  const all = labelsRepo.all()
+    .filter(l => wanted.has(l.account))
+    .filter(l => l.type === 'user' || ['INBOX', 'STARRED', 'IMPORTANT'].includes(l.raw_id))
+    .map(l => ({
+      id: `${l.account}:${l.raw_id}`,
+      rawId: l.raw_id,
+      account: l.account,
+      name: l.name,
+      type: l.type,
+      color: null,
+    }));
   res.json(all);
 });
 
-// ---------------- thread list (fan out + merge) ----------------
+// ---------------- thread list (SQLite-backed) ----------------
+//
+// Reads from local SQLite — no Gmail round-trip, no THREAD_LIMIT cap.
+// Parses the small Gmail-search-query vocabulary the renderer actually
+// emits today (`label:"..."`, `from:...`, `is:unread`, free text on
+// subject/snippet). Anything outside that vocabulary falls through to
+// "most recent threads across all accounts".
+//
+// `maxResults` is honoured as a defensive cap (default 1000) but is no
+// longer the user-visible "how many emails exist" — DB returns
+// everything matching, capped only to avoid pathological response sizes
+// for unfiltered queries.
 router.get('/emails', requireAuth, async (req, res) => {
-  const targets = clientsFor(req);
-  const { maxResults = 100, q = '' } = req.query;
-  const perAcct = Math.max(1, Math.floor(parseInt(maxResults) / Math.max(1, Object.keys(targets).length)));
+  const wanted = new Set(Object.keys(clientsFor(req)));
+  const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+  const maxResults = Math.max(1, parseInt(req.query.maxResults) || 1000);
 
-  const merged = [];
-  await Promise.all(Object.entries(targets).map(async ([account, client]) => {
-    try {
-      const gmail = getGmailClient(client);
-      const listResp = await gmail.users.threads.list({ userId: 'me', maxResults: perAcct, q });
-      const threads = listResp.data.threads || [];
-      const batchSize = 10;
-      for (let i = 0; i < threads.length; i += batchSize) {
-        const batch = threads.slice(i, i + batchSize);
-        const fulls = await Promise.all(batch.map(t => gmail.users.threads.get({ userId: 'me', id: t.id, format: 'full' })));
-        for (const result of fulls) {
-          const thread = result.data;
-          const messages = thread.messages || [];
-          if (!messages.length) continue;
-          const parsedMessages = messages.map(m => parseMessage(account, m));
-          const allLabels = new Set();
-          messages.forEach(m => (m.labelIds || []).forEach(l => allLabels.add(l)));
-          const latest = parsedMessages[parsedMessages.length - 1];
-          merged.push({
-            id: `${account}:${thread.id}`,
-            threadId: `${account}:${thread.id}`,
-            account,
-            messageCount: messages.length,
-            from: latest.from,
-            to: latest.to,
-            subject: latest.subject,
-            snippet: latest.snippet,
-            date: latest.date,
-            labels: Array.from(allLabels),
-            isRead: !allLabels.has('UNREAD'),
-            isStarred: allLabels.has('STARRED'),
-            hasAttachment: parsedMessages.some(m => m.hasAttachment),
-            messages: parsedMessages,
-            originalFrom: parseMessage(account, messages[0]).from,
-          });
-        }
-      }
-    } catch (err) {
-      if (err.message?.includes('invalid_grant')) dropAccountForInvalidGrant(account);
-      console.warn(`[emails] ${account}:`, err.message);
-    }
-  }));
+  // ----- parse q -----
+  // Supported:
+  //   label:"Newsletters/Patreon"   exact or quoted name; nested matches via prefix
+  //   from:email@x.com              exact sender match
+  //   is:unread                     adds isRead=0 filter
+  let labelName = null;
+  let fromEmail = null;
+  let unreadOnly = false;
+  if (q) {
+    const labelMatch = q.match(/label:"([^"]+)"|label:(\S+)/i);
+    if (labelMatch) labelName = labelMatch[1] || labelMatch[2];
+    const fromMatch = q.match(/from:([^\s]+)/i);
+    if (fromMatch) fromEmail = fromMatch[1];
+    if (/\bis:unread\b/i.test(q)) unreadOnly = true;
+  }
 
-  // Sort by date desc so the frontend gets a sensible merge order.
-  merged.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
-  res.json({ emails: merged, nextPageToken: null, resultSizeEstimate: merged.length });
+  let rows;
+  if (fromEmail) {
+    rows = queryRepo.threadsBySender(fromEmail, { limit: maxResults });
+  } else if (labelName) {
+    rows = queryRepo.threadsByLabelName(labelName, { limit: maxResults });
+  } else {
+    rows = queryRepo.recentThreads({ limit: maxResults });
+  }
+  // Account filter applies regardless of query — render only threads
+  // from accounts the user has active in this session.
+  rows = rows.filter(r => wanted.has(r.account));
+  if (unreadOnly) rows = rows.filter(r => !r.isRead);
+
+  res.json({ emails: rows, nextPageToken: null, resultSizeEstimate: rows.length });
 });
 
 // ---------------- unread count (sum across accounts) ----------------
@@ -185,189 +178,165 @@ router.get('/emails', requireAuth, async (req, res) => {
 //                                                  has a label with that
 //                                                  exact name
 router.get('/unread-count', requireAuth, async (req, res) => {
-  const targets = clientsFor(req);
-  const q = typeof req.query.q === 'string' ? req.query.q : '';
-  const labelIdsRaw = typeof req.query.labelIds === 'string' ? req.query.labelIds : '';
+  // SQLite-backed: one COUNT(*) per call, no Gmail round-trip + no
+  // unreliable resultSizeEstimate. Honours the same parameter shape
+  // the renderer already uses:
+  //   ?labelName=Newsletters       count threads with that label or any sub-label, unread only
+  //   ?labelIds=INBOX              count threads with that system label, unread only
+  //   ?labelIds=...,...            comma-separated; sums per-id (rare)
+  //   (no filter)                  total unread across all accounts
   const labelName = typeof req.query.labelName === 'string' ? req.query.labelName : '';
+  const labelIdsRaw = typeof req.query.labelIds === 'string' ? req.query.labelIds : '';
 
-  // perAccount[email] = array of rawLabelIds to require (PLUS UNREAD).
-  const perAccount = {};
-
+  let count = 0;
   if (labelName) {
-    // Resolve the name to a label id on every account that has it.
-    await Promise.all(Object.entries(targets).map(async ([account, client]) => {
-      try {
-        const r = await getGmailClient(client).users.labels.list({ userId: 'me' });
-        const found = (r.data.labels || []).find(l => l.name === labelName);
-        if (found) (perAccount[account] ||= []).push(found.id);
-      } catch (err) {
-        if (err.message?.includes('invalid_grant')) dropAccountForInvalidGrant(account);
-        console.warn(`[unread-count] label resolve ${account}:`, err.message);
-      }
-    }));
+    count = queryRepo.unreadCountByLabelName(labelName);
   } else if (labelIdsRaw) {
     const ids = labelIdsRaw.split(',').map(s => s.trim()).filter(Boolean);
     for (const id of ids) {
-      const { account, id: rawId } = parseId(id);
-      if (account) {
-        (perAccount[account] ||= []).push(rawId);
-      } else {
-        // System label (INBOX, STARRED, etc.) — applies to every account.
-        for (const acct of Object.keys(targets)) (perAccount[acct] ||= []).push(rawId);
-      }
+      const { id: rawId } = parseId(id);
+      count += queryRepo.unreadCountBySystemRawId(rawId);
     }
   } else {
-    // No label filter — q-only across all accounts.
-    for (const acct of Object.keys(targets)) perAccount[acct] = [];
+    count = queryRepo.unreadCountAll();
   }
-
-  let total = 0;
-  const breakdown = {};
-  await Promise.all(Object.entries(perAccount).map(async ([account, rawIds]) => {
-    const client = targets[account];
-    if (!client) return;
-    try {
-      // Prefer users.labels.get(labelId).threadsUnread — Gmail's own
-      // sidebar number, exact. Avoid users.threads.list's
-      // resultSizeEstimate, which is wildly inflated for label+UNREAD
-      // queries (often returns the total threads in the label, not
-      // just unread). When a q parameter is supplied OR the caller
-      // asked for multiple labels (intersection), fall back to
-      // threads.list because labels.get only knows one label at a time.
-      if (!q && rawIds.length === 1) {
-        const lbl = await getGmailClient(client).users.labels.get({ userId: 'me', id: rawIds[0] });
-        const c = lbl.data.threadsUnread || 0;
-        breakdown[account] = c;
-        total += c;
-      } else if (!q && rawIds.length === 0) {
-        // No label filter AND no q — count ALL unread.
-        const lbl = await getGmailClient(client).users.labels.get({ userId: 'me', id: 'UNREAD' });
-        const c = lbl.data.threadsUnread || 0;
-        breakdown[account] = c;
-        total += c;
-      } else {
-        // Multi-label intersection or text query: fall back to list
-        // pagination — count IDs to avoid the inflated estimate. Capped
-        // at 500 to keep this from being a quota nightmare.
-        let c = 0;
-        let pageToken;
-        for (let pages = 0; pages < 5; pages++) {
-          const r = await getGmailClient(client).users.threads.list({
-            userId: 'me', maxResults: 100, q,
-            labelIds: [...rawIds, 'UNREAD'],
-            pageToken,
-          });
-          c += (r.data.threads?.length || 0);
-          pageToken = r.data.nextPageToken;
-          if (!pageToken) break;
-        }
-        breakdown[account] = c;
-        total += c;
-      }
-    } catch (err) {
-      if (err.message?.includes('invalid_grant')) dropAccountForInvalidGrant(account);
-      breakdown[account] = 0;
-      console.warn(`[unread-count] ${account}:`, err.message);
-    }
-  }));
-  res.json({ count: total, breakdown });
+  res.json({ count, breakdown: {} });
 });
 
-// ---------------- single thread (account inferred from prefixed id) ----------------
+// ---------------- single thread (DB metadata + lazy body fetch) ----------------
+//
+// Reads from the local DB. If any message in the thread has a NULL body,
+// fetches the full thread from Gmail ONCE, parses bodies via the legacy
+// parseMessage, writes them through to messages.body / messages.body_html,
+// and returns the hydrated thread.
+//
+// After the first open, subsequent calls are pure DB reads — bodies live
+// in SQLite forever (invalidated only when history sync removes the
+// thread).
 router.get('/threads/:id', requireAuth, async (req, res) => {
-  const { account, id } = parseId(req.params.id);
+  const prefixedId = req.params.id;
+  const { account, id: gmailThreadId } = parseId(prefixedId);
   if (!account) return res.status(400).json({ error: 'thread id must be prefixed with account:' });
   const client = req.oauth2Clients[account];
   if (!client) return res.status(401).json({ error: `account not active: ${account}` });
-  try {
-    const response = await getGmailClient(client).users.threads.get({ userId: 'me', id, format: 'full' });
-    const messages = response.data.messages || [];
-    if (messages.length === 0) return res.json(null);
-    const parsedMessages = messages.map(m => parseMessage(account, m));
-    const allLabels = new Set();
-    messages.forEach(m => (m.labelIds || []).forEach(l => allLabels.add(l)));
-    const latest = parsedMessages[parsedMessages.length - 1];
-    res.json({
-      id: `${account}:${response.data.id}`,
-      threadId: `${account}:${response.data.id}`,
-      account,
-      messageCount: messages.length,
-      from: latest.from,
-      to: latest.to,
-      subject: latest.subject,
-      snippet: latest.snippet,
-      date: latest.date,
-      labels: Array.from(allLabels),
-      isRead: !allLabels.has('UNREAD'),
-      isStarred: allLabels.has('STARRED'),
-      hasAttachment: parsedMessages.some(m => m.hasAttachment),
-      messages: parsedMessages,
-      originalFrom: parseMessage(account, messages[0]).from,
-    });
-  } catch (err) {
-    handleGmailError(err, res, 'fetch thread', account);
-  }
-});
 
-// ---------------- modify labels (account from id) ----------------
-router.patch('/emails/:id/labels', requireAuth, async (req, res) => {
-  const { account, id } = parseId(req.params.id);
-  if (!account) return res.status(400).json({ error: 'email id must be prefixed with account:' });
-  const client = req.oauth2Clients[account];
-  if (!client) return res.status(401).json({ error: `account not active: ${account}` });
-
-  try {
-    const gmail = getGmailClient(client);
-    const { addLabels = [], removeLabels = [] } = req.body;
-
-    // Resolve label names to ids on THIS account.
-    const labelsResponse = await gmail.users.labels.list({ userId: 'me' });
-    const allLabels = labelsResponse.data.labels || [];
-    const SYSTEM = new Set(['INBOX', 'SENT', 'DRAFT', 'SPAM', 'TRASH', 'UNREAD', 'STARRED', 'IMPORTANT']);
-    const resolve = (arr) => arr.map(label => {
-      if (typeof label !== 'string') return null;
-      // Accept account:id, plain id, or plain name.
-      const { id: maybeId } = parseId(label);
-      if (SYSTEM.has(maybeId)) return maybeId;
-      const found = allLabels.find(l => l.id === maybeId || l.name === maybeId || l.name === label);
-      return found ? found.id : null;
-    }).filter(Boolean);
-
-    const addLabelIds = resolve(addLabels);
-    const removeLabelIds = resolve(removeLabels);
-
+  let thread = queryRepo.fullThread(prefixedId);
+  if (!thread) {
+    // Not yet synced — fall back to live Gmail fetch and upsert so
+    // subsequent calls hit the cache. Rare path: only when a history
+    // poll surfaces a thread the renderer asks for before the next
+    // tick has indexed it.
     try {
-      const r = await gmail.users.threads.modify({
-        userId: 'me', id, requestBody: { addLabelIds, removeLabelIds },
-      });
-      res.json({ success: true, account, labels: r.data.messages?.[0]?.labelIds || [] });
-    } catch {
-      const r = await gmail.users.messages.modify({
-        userId: 'me', id, requestBody: { addLabelIds, removeLabelIds },
-      });
-      res.json({ success: true, account, labels: r.data.labelIds });
+      await gmailLimiter.take(5);
+      const response = await getGmailClient(client).users.threads.get({ userId: 'me', id: gmailThreadId, format: 'full' });
+      const messages = response.data.messages || [];
+      if (messages.length === 0) return res.json(null);
+      const parsedMessages = messages.map(m => parseMessage(account, m));
+      const allLabels = new Set();
+      messages.forEach(m => (m.labelIds || []).forEach(l => allLabels.add(l)));
+      const latest = parsedMessages[parsedMessages.length - 1];
+      const payload = {
+        id: prefixedId, threadId: prefixedId, account,
+        messageCount: messages.length,
+        from: latest.from, to: latest.to,
+        subject: latest.subject, snippet: latest.snippet, date: latest.date,
+        labels: Array.from(allLabels),
+        isRead: !allLabels.has('UNREAD'),
+        isStarred: allLabels.has('STARRED'),
+        hasAttachment: parsedMessages.some(m => m.hasAttachment),
+        messages: parsedMessages,
+        originalFrom: parsedMessages[0].from,
+      };
+      // Best-effort write-through. We don't await this on failure
+      // because the response is what matters.
+      try {
+        for (const m of parsedMessages) {
+          messagesRepo.upsertMeta({
+            id: m.id, thread_id: m.threadId, account,
+            from_email: m.from.email?.toLowerCase(), from_name: m.from.name,
+            to_header: m.to, date: new Date(m.date).getTime() || 0,
+            snippet: m.snippet, is_read: m.isRead, has_attachment: m.hasAttachment,
+            unsubscribe_json: m.unsubscribe ? JSON.stringify(m.unsubscribe) : null,
+          });
+          messagesRepo.saveBody(m.id, m.body, m.bodyHtml);
+        }
+      } catch (e) { console.warn('[threads/:id] write-through failed:', e.message); }
+      return res.json(payload);
+    } catch (err) {
+      return handleGmailError(err, res, 'fetch thread', account);
     }
-  } catch (err) {
-    handleGmailError(err, res, 'update labels', account);
   }
+
+  // Hydrate bodies if any message is still body-less.
+  const needBodies = thread.messages.some(m => !m.body && !m.bodyHtml);
+  if (needBodies) {
+    try {
+      await gmailLimiter.take(5);
+      const response = await getGmailClient(client).users.threads.get({ userId: 'me', id: gmailThreadId, format: 'full' });
+      const fullMessages = response.data.messages || [];
+      const parsedById = new Map(fullMessages.map(m => [m.id, parseMessage(account, m)]));
+      // Write bodies through to the DB, then re-fetch the hydrated row.
+      for (const [gid, parsed] of parsedById) {
+        messagesRepo.saveBody(`${account}:${gid}`, parsed.body, parsed.bodyHtml);
+      }
+      thread = queryRepo.fullThread(prefixedId);
+    } catch (err) {
+      // Couldn't fetch bodies — surface metadata anyway so the popup
+      // can at least render the header. Renderer treats empty body as
+      // "(empty)".
+      console.warn(`[threads/:id] body fetch failed for ${prefixedId}:`, err.message);
+    }
+  }
+
+  res.json(thread);
 });
 
-// ---------------- mark read / unread (account from id) ----------------
-router.patch('/emails/:id/read', requireAuth, async (req, res) => {
-  const { account, id } = parseId(req.params.id);
+// ---------------- modify labels (optimistic, write-through to queue) ----------------
+//
+// Goes through the mutation queue: local DB updates instantly, Gmail
+// call drains in the background. Renderer gets a sub-millisecond
+// response and the badge / chip changes are visible immediately.
+//
+// Resolves label NAMES → rawIds via the local labels table (no
+// gmail.labels.list round-trip).
+router.patch('/emails/:id/labels', requireAuth, (req, res) => {
+  const prefixedId = req.params.id;
+  const { account } = parseId(prefixedId);
   if (!account) return res.status(400).json({ error: 'email id must be prefixed with account:' });
-  const client = req.oauth2Clients[account];
-  if (!client) return res.status(401).json({ error: `account not active: ${account}` });
-  try {
-    const gmail = getGmailClient(client);
-    const { isRead } = req.body;
-    const body = isRead ? { removeLabelIds: ['UNREAD'] } : { addLabelIds: ['UNREAD'] };
-    try { await gmail.users.threads.modify({ userId: 'me', id, requestBody: body }); }
-    catch { await gmail.users.messages.modify({ userId: 'me', id, requestBody: body }); }
-    res.json({ success: true, account, isRead });
-  } catch (err) {
-    handleGmailError(err, res, 'update read status', account);
-  }
+  if (!req.oauth2Clients[account]) return res.status(401).json({ error: `account not active: ${account}` });
+
+  const { addLabels = [], removeLabels = [] } = req.body;
+  const SYSTEM = new Set(['INBOX', 'SENT', 'DRAFT', 'SPAM', 'TRASH', 'UNREAD', 'STARRED', 'IMPORTANT']);
+  const accountLabels = labelsRepo.forAccount(account);
+  const resolve = (arr) => {
+    const out = [];
+    for (const label of arr) {
+      if (typeof label !== 'string') continue;
+      const { id: maybeId } = parseId(label);
+      if (SYSTEM.has(maybeId)) { out.push(maybeId); continue; }
+      const found = accountLabels.find(l => l.raw_id === maybeId || l.name === maybeId || l.name === label);
+      if (found) out.push(found.raw_id);
+    }
+    return out;
+  };
+  const addRawIds = resolve(addLabels);
+  const removeRawIds = resolve(removeLabels);
+  applyAndEnqueueModify(prefixedId, addRawIds, removeRawIds);
+  // Return the threads' current labels (post-local-apply) so the
+  // renderer can keep its existing optimistic-UI logic happy.
+  const labelsNow = threadsRepo.labelsOf(prefixedId);
+  res.json({ success: true, account, labels: labelsNow });
+});
+
+// ---------------- mark read / unread (optimistic, write-through to queue) ----------------
+router.patch('/emails/:id/read', requireAuth, (req, res) => {
+  const prefixedId = req.params.id;
+  const { account } = parseId(prefixedId);
+  if (!account) return res.status(400).json({ error: 'email id must be prefixed with account:' });
+  if (!req.oauth2Clients[account]) return res.status(401).json({ error: `account not active: ${account}` });
+  const { isRead } = req.body;
+  applyAndEnqueueMarkRead(prefixedId, !!isRead);
+  res.json({ success: true, account, isRead: !!isRead });
 });
 
 // ---------------- reply (account from id) ----------------

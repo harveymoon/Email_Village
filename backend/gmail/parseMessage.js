@@ -66,13 +66,21 @@ export function extractUnsubscribe(listHeader, postHeader, html) {
   return null;
 }
 
-// LEGACY: existing shape consumed by routes/gmail.js. Keep until the
-// frontend stops calling /api/threads/:id directly (Phase F).
-export function parseMessage(account, message) {
+// Common header walk + body extraction for one Gmail message. Both
+// parseMessage (legacy frontend shape) and parseMessageMeta (DB-row
+// shape used by the sync engine) call this and reshape the result.
+// Centralising the From/Date/Unsubscribe logic prevents the slow drift
+// that started to creep in between the two earlier variants.
+function parseMessageBase(account, message, opts = {}) {
   const headers = message.payload?.headers || [];
-  const snippet = message.snippet || '';
+  const labelIds = message.labelIds || [];
+  const fromHeader = getHeader(headers, 'From');
+  const from = parseFrom(fromHeader);
+  const dateStr = getHeader(headers, 'Date');
+  const dateMs = dateStr ? Date.parse(dateStr) || 0 : 0;
+  const hasAttachment = !!message.payload?.parts?.some(p => p.filename && p.filename.length > 0);
   let body = '', bodyHtml = '';
-  if (message.payload) {
+  if (opts.withBody && message.payload) {
     if (message.payload.body?.data) {
       const content = decodeBody(message.payload.body.data);
       if (message.payload.mimeType === 'text/html') bodyHtml = content;
@@ -82,53 +90,56 @@ export function parseMessage(account, message) {
       body = p.text || ''; bodyHtml = p.html || '';
     }
   }
-  const fromHeader = getHeader(headers, 'From');
-  const fromMatch = parseFrom(fromHeader);
-  const hasAttachment = message.payload?.parts?.some(p => p.filename && p.filename.length > 0) || false;
+  const unsubscribe = extractUnsubscribe(
+    getHeader(headers, 'List-Unsubscribe'),
+    getHeader(headers, 'List-Unsubscribe-Post'),
+    opts.withBody ? bodyHtml : null,
+  );
+  return {
+    headers, labelIds, from, dateStr, dateMs, hasAttachment, body, bodyHtml, unsubscribe,
+  };
+}
+
+// LEGACY: existing shape consumed by routes/gmail.js single-thread
+// fetch route. Kept until the renderer stops calling /api/threads/:id
+// in favour of an IPC-backed DB read (deferred F.2 work).
+export function parseMessage(account, message) {
+  const base = parseMessageBase(account, message, { withBody: true });
   return {
     id: `${account}:${message.id}`,
     threadId: `${account}:${message.threadId}`,
     account,
-    from: { name: fromMatch.name, email: fromMatch.email, avatar: null },
-    to: getHeader(headers, 'To'),
-    subject: getHeader(headers, 'Subject') || '(no subject)',
-    snippet,
-    body,
-    bodyHtml,
-    date: getHeader(headers, 'Date'),
-    labels: message.labelIds || [],
-    isRead: !message.labelIds?.includes('UNREAD'),
-    isStarred: message.labelIds?.includes('STARRED'),
-    hasAttachment,
-    unsubscribe: extractUnsubscribe(getHeader(headers, 'List-Unsubscribe'), getHeader(headers, 'List-Unsubscribe-Post'), bodyHtml),
+    from: { name: base.from.name, email: base.from.email, avatar: null },
+    to: getHeader(base.headers, 'To'),
+    subject: getHeader(base.headers, 'Subject') || '(no subject)',
+    snippet: message.snippet || '',
+    body: base.body,
+    bodyHtml: base.bodyHtml,
+    date: base.dateStr,
+    labels: base.labelIds,
+    isRead: !base.labelIds.includes('UNREAD'),
+    isStarred: base.labelIds.includes('STARRED'),
+    hasAttachment: base.hasAttachment,
+    unsubscribe: base.unsubscribe,
   };
 }
 
-// NEW: DB-row-shaped per-message metadata. Used by the sync engine
-// when batching threads.get(format='metadata'). Body fields stay
-// undefined because metadata fetches don't include them.
+// DB-row-shaped per-message metadata. Used by the sync engine when
+// batching threads.get(format='metadata'). Body fields stay null.
 export function parseMessageMeta(account, message) {
-  const headers = message.payload?.headers || [];
-  const fromHeader = getHeader(headers, 'From');
-  const fromMatch = parseFrom(fromHeader);
-  const dateStr = getHeader(headers, 'Date');
-  const dateMs = dateStr ? Date.parse(dateStr) || 0 : 0;
-  const labelIds = message.labelIds || [];
+  const base = parseMessageBase(account, message, { withBody: false });
   return {
     id: `${account}:${message.id}`,
     thread_id: `${account}:${message.threadId}`,
     account,
-    from_email: fromMatch.email?.toLowerCase() || null,
-    from_name: fromMatch.name || null,
-    to_header: getHeader(headers, 'To') || null,
-    date: dateMs,
+    from_email: base.from.email?.toLowerCase() || null,
+    from_name: base.from.name || null,
+    to_header: getHeader(base.headers, 'To') || null,
+    date: base.dateMs,
     snippet: message.snippet || null,
-    is_read: !labelIds.includes('UNREAD'),
-    has_attachment: !!message.payload?.parts?.some(p => p.filename && p.filename.length > 0),
-    unsubscribe_json: (() => {
-      const u = extractUnsubscribe(getHeader(headers, 'List-Unsubscribe'), getHeader(headers, 'List-Unsubscribe-Post'), null);
-      return u ? JSON.stringify(u) : null;
-    })(),
+    is_read: !base.labelIds.includes('UNREAD'),
+    has_attachment: base.hasAttachment,
+    unsubscribe_json: base.unsubscribe ? JSON.stringify(base.unsubscribe) : null,
   };
 }
 

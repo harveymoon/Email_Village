@@ -9,18 +9,14 @@
 // so the frontend can disambiguate which account a thread belongs to.
 
 import express from 'express';
-import { google } from 'googleapis';
 import { requireAuth, dropAccountForInvalidGrant } from './auth.js';
 import { parseMessage, extractUnsubscribe } from '../gmail/parseMessage.js';
+import { getGmailClient } from '../gmail/client.js';
 import { labelsRepo, threadsRepo, messagesRepo, queryRepo, statusRepo, bindingsRepo, avatarsRepo, peopleOverridesRepo } from '../db/repositories.js';
 import { applyAndEnqueueModify, applyAndEnqueueMarkRead } from '../services/mutationQueue.js';
 import { gmailLimiter } from '../services/rateLimiter.js';
 
 const router = express.Router();
-
-function getGmailClient(oauth2Client) {
-  return google.gmail({ version: 'v1', auth: oauth2Client });
-}
 
 // Strip `account:` prefix from a possibly-prefixed id.
 // Returns { account: string | null, id: string }.

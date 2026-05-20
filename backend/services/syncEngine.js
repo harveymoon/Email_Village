@@ -10,19 +10,17 @@
 // All work happens AFTER auth.js has loaded tokens from disk — call
 // `bootstrapSync()` once from server.js on startup.
 
-import { google } from 'googleapis';
 import { getAllAuthenticatedClients, reportInvalidGrant } from '../routes/auth.js';
 import { accountsRepo, labelsRepo, threadsRepo, messagesRepo } from '../db/repositories.js';
 import { parseThreadMeta } from '../gmail/parseMessage.js';
+import { getGmailClient } from '../gmail/client.js';
 import { gmailLimiter } from './rateLimiter.js';
 import { startMutationDrain } from './mutationQueue.js';
 
 const PAGE_SIZE = 100;          // Gmail's max for threads.list
 const GET_BATCH = 10;           // how many threads.get calls to fire in parallel
 
-function gmail(client) {
-  return google.gmail({ version: 'v1', auth: client });
-}
+const gmail = getGmailClient;
 
 // In-flight tracker so two callers can't kick off duplicate backfills
 // for the same account. Resolves to true when complete.

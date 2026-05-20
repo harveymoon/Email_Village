@@ -14,18 +14,16 @@
 // because mutation_queue lives in the same SQLite file as the rest of
 // the data.
 
-import { google } from 'googleapis';
 import { getAllAuthenticatedClients, reportInvalidGrant } from '../routes/auth.js';
 import { threadsRepo, mutationQueueRepo, atomicMutations } from '../db/repositories.js';
+import { getGmailClient } from '../gmail/client.js';
 import { gmailLimiter } from './rateLimiter.js';
 
 const DRAIN_TICK_MS = 1000;
 const BATCH_SIZE = 5;                 // how many ops we attempt per tick (each consumes its own quota)
 const MAX_ATTEMPTS_BEFORE_FAIL = 6;   // ~exponential backoff to 64s before we give up
 
-function gmail(client) {
-  return google.gmail({ version: 'v1', auth: client });
-}
+const gmail = getGmailClient;
 
 // ---------------- public: write-through helpers ----------------
 //

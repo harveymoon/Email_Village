@@ -541,9 +541,18 @@ function openFloorMovePopover(
     const away = (e: MouseEvent) => {
       if (pop.contains(e.target as Node)) return;
       pop.remove();
-      document.removeEventListener('mousedown', away, true);
     };
     document.addEventListener('mousedown', away, true);
+    // Override remove() so any call path that destroys the popover
+    // (outside-click, destination-pick, external close) also detaches
+    // the document listener — without this, picking a destination
+    // called .remove() without removing `away`, leaving an orphaned
+    // listener on document for the rest of the session.
+    const origRemove = pop.remove.bind(pop);
+    pop.remove = () => {
+      document.removeEventListener('mousedown', away, true);
+      origRemove();
+    };
   }, 0);
 }
 
@@ -674,9 +683,18 @@ function openQuickMovePopover(
     const away = (e: MouseEvent) => {
       if (pop.contains(e.target as Node)) return;
       pop.remove();
-      document.removeEventListener('mousedown', away, true);
     };
     document.addEventListener('mousedown', away, true);
+    // Override remove() so any call path that destroys the popover
+    // (outside-click, destination-pick, external close) also detaches
+    // the document listener — without this, picking a destination
+    // called .remove() without removing `away`, leaving an orphaned
+    // listener on document for the rest of the session.
+    const origRemove = pop.remove.bind(pop);
+    pop.remove = () => {
+      document.removeEventListener('mousedown', away, true);
+      origRemove();
+    };
   }, 0);
 }
 

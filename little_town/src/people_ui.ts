@@ -642,9 +642,16 @@ function openPersonMoveAllPicker(anchor: HTMLElement, opts: OpenPersonPopupOptio
     const away = (e: MouseEvent) => {
       if (pop.contains(e.target as Node)) return;
       pop.remove();
-      document.removeEventListener('mousedown', away, true);
     };
     document.addEventListener('mousedown', away, true);
+    // Override remove() so the document listener gets cleaned up
+    // regardless of how the popover is destroyed (outside-click,
+    // destination-pick, or external dismissal).
+    const origRemove = pop.remove.bind(pop);
+    pop.remove = () => {
+      document.removeEventListener('mousedown', away, true);
+      origRemove();
+    };
   }, 0);
 }
 
@@ -824,10 +831,6 @@ export function spriteAvatar(charKey: string, size: number): HTMLDivElement {
     overflow:hidden;
   `;
   return d;
-}
-
-function humanizeCharKey(k: string): string {
-  return k.replace(/^char_/, '').replace(/_/g, ' ');
 }
 
 // ---------- Avatar customizer (sub-popup) ----------

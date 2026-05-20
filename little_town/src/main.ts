@@ -13,8 +13,8 @@ import { aggregatePeople, threadsForPerson, saveOverride, characterForEmail } fr
 import { clampPopupToViewport } from './ui_helpers';
 import { openRulesPane, openRuleEditor, summarizeRuleCriteria, summarizeRuleAction, type StaleRuleMatch } from './rules_ui';
 import { openPeopleGrid, openPersonPopup, openAvatarCustomizer } from './people_ui';
-import { avatarPortraitForEmail, ensureAvatar, randomAvatar, saveAvatar, hydrateAvatars } from './avatar';
-import { hydratePeopleOverrides } from './people';
+import { avatarPortraitForEmail, ensureAvatar, randomAvatar, saveAvatar, hydrateAvatars, resetAvatarsForAccountChange } from './avatar';
+import { hydratePeopleOverrides, resetPeopleOverridesForAccountChange } from './people';
 import { composeAndRegisterAvatar, AVATAR_FRAMES } from './avatar_texture';
 import { mountStatusBar, setStatus } from './status_bar';
 
@@ -373,7 +373,7 @@ class VillageScene extends Phaser.Scene {
     const worker = async (): Promise<void> => {
       while (next < names.length) {
         const i = next++;
-        try { await this.loadThreadsForLabel(names[i], false, 50); }
+        try { await this.loadThreadsForLabel(names[i], false); }
         catch (err) { console.warn(`[pre-cache] ${names[i]} failed:`, err); }
       }
     };
@@ -419,7 +419,12 @@ class VillageScene extends Phaser.Scene {
     // avatar module fires this event. We re-compose + swap the
     // matching in-world sprite (player or NPC) on the fly so the user
     // sees the change immediately.
-    document.addEventListener('avatar:updated', (e: Event) => {
+    // Document listeners stored on `this.sceneDocListeners` so we can
+    // remove them on Phaser's shutdown event (see registerShutdown()
+    // below). Without that, a scene restart leaks the listener AND its
+    // closure over the old `this`, so the handler fires against a dead
+    // scene and corrupts NPC state.
+    this.avatarUpdatedHandler = (e: Event) => {
       const email = (e as CustomEvent).detail?.email;
       if (!email) return;
       if (email === '__player__@local') {
@@ -429,13 +434,16 @@ class VillageScene extends Phaser.Scene {
         this.refreshNpcsForEmail(email).catch(err =>
           console.warn(`[avatar:updated] npc refresh failed for ${email}`, err));
       }
-    });
-    // Rules pane / editor dispatches this after a create or delete —
-    // refresh our cache so the Move-to suggestion engine sees the new
-    // (or deleted) rule on the very next picker open.
-    document.addEventListener('rules:updated', () => {
+    };
+    this.rulesUpdatedHandler = () => {
       this.loadRulesCache(true).catch(() => { /* logged inside */ });
-    });
+    };
+    document.addEventListener('avatar:updated', this.avatarUpdatedHandler);
+    document.addEventListener('rules:updated', this.rulesUpdatedHandler);
+    this.sceneDocListeners.push(
+      ['avatar:updated', this.avatarUpdatedHandler],
+      ['rules:updated', this.rulesUpdatedHandler],
+    );
 
     const raw = this.cache.json.get('mapdata');
     raw.tilesets = raw.tilesets.filter((t: any) => typeof t.image === 'string' && t.image.length > 0);
@@ -1043,29 +1051,70 @@ class VillageScene extends Phaser.Scene {
     //      preventDefault, so the input still receives the keystroke.
     //  (b) Phaser keyboard.enabled toggle as backup (kills Key.isDown
     //      polling too, so update()'s WASD scan stays silent).
-    document.addEventListener('keydown', (e) => {
-      if (isEditable(e.target as Element)) e.stopPropagation();
-    }, true);
-    document.addEventListener('focusin', (e) => {
-      if (isEditable(e.target as Element)) {
+    const keydownCapture = (e: Event) => {
+      if (isEditable((e as KeyboardEvent).target as Element)) e.stopPropagation();
+    };
+    const focusinHandler = (e: Event) => {
+      if (isEditable((e as FocusEvent).target as Element)) {
         this.isTyping = true;
         if (this.input.keyboard) this.input.keyboard.enabled = false;
       }
-    });
-    document.addEventListener('focusout', () => {
+    };
+    const focusoutHandler = () => {
       setTimeout(() => {
         if (!isEditable(document.activeElement)) {
           this.isTyping = false;
           if (this.input.keyboard) this.input.keyboard.enabled = true;
         }
       }, 0);
-    });
+    };
+    document.addEventListener('keydown', keydownCapture, true);
+    document.addEventListener('focusin', focusinHandler);
+    document.addEventListener('focusout', focusoutHandler);
+    // Tracked for shutdown cleanup; the capture-phase keydown needs
+    // useCapture=true on the matching removeEventListener call, so it
+    // gets its own tuple shape (the trailing `true`).
+    this.sceneDocListeners.push(
+      ['focusin', focusinHandler],
+      ['focusout', focusoutHandler],
+    );
+    this.sceneDocListenersCapture.push(['keydown', keydownCapture]);
+
+    // Register one Phaser shutdown handler that tears down EVERY
+    // document-scoped listener + the background polling interval.
+    // Without this, scene restarts (avatar swap edge cases, future
+    // scene-replacement code) accumulate dead listeners against the
+    // detached scene instance.
+    this.events.once('shutdown', () => this.cleanupSceneState());
 
     // Gmail auth gate (Town Inbox feature). Async — runs in the background;
     // game remains playable while we check. If not authed, a modal blocks
     // any email-related action. If authed, render a small badge with the
     // user's email in the top-right corner.
     this.bootstrapAuth();
+  }
+
+  // ---- shutdown cleanup (C4 + C5 from the audit) ----
+  // Listeners registered against `document` outlive the Phaser scene
+  // unless explicitly removed. So does setInterval. We collect them
+  // here and tear down in one place on the 'shutdown' event.
+  private sceneDocListeners: Array<[string, EventListenerOrEventListenerObject]> = [];
+  private sceneDocListenersCapture: Array<[string, EventListenerOrEventListenerObject]> = [];
+  private avatarUpdatedHandler: ((e: Event) => void) | null = null;
+  private rulesUpdatedHandler: ((e: Event) => void) | null = null;
+
+  private cleanupSceneState(): void {
+    for (const [type, h] of this.sceneDocListeners) document.removeEventListener(type, h);
+    for (const [type, h] of this.sceneDocListenersCapture) document.removeEventListener(type, h, true);
+    this.sceneDocListeners.length = 0;
+    this.sceneDocListenersCapture.length = 0;
+    this.avatarUpdatedHandler = null;
+    this.rulesUpdatedHandler = null;
+    if (this.pollIntervalId !== null) {
+      window.clearInterval(this.pollIntervalId);
+      this.pollIntervalId = null;
+    }
+    console.log('[scene] shutdown cleanup complete');
   }
 
   // Auth flow: poll /auth/status, react. Re-runs cheaply on `?auth_success=true`
@@ -1081,6 +1130,11 @@ class VillageScene extends Phaser.Scene {
     try {
       const status = await api.authStatus();
       if (status.authenticated && status.accounts.length) {
+        const previousAccounts = new Set(this.currentAccounts.map(a => a.email));
+        const newAccounts = new Set(status.accounts.map(a => a.email));
+        const accountsChanged = previousAccounts.size > 0 &&
+          (previousAccounts.size !== newAccounts.size ||
+           [...newAccounts].some(e => !previousAccounts.has(e)));
         this.currentAccounts = status.accounts;
         this.dismissConnectionWarning();
         if (new URLSearchParams(location.search).has('auth_success')) {
@@ -1088,6 +1142,19 @@ class VillageScene extends Phaser.Scene {
         }
         // Multi-account: clear caches before respawn so the new account's
         // threads merge in. Background poll picks up subsequent changes.
+        // Also reset the module-level avatar + people caches AND the
+        // labelCache (which is account-scoped — Account A's rawIds
+        // would otherwise stick around and corrupt B's name->rawId
+        // resolution in moveThread). Only does the heavier reset when
+        // the account set actually changed (the bootstrapAuth path runs
+        // once at game start, and once on every successful re-auth).
+        if (accountsChanged) {
+          console.log('[auth] account set changed, resetting module caches');
+          resetAvatarsForAccountChange();
+          resetPeopleOverridesForAccountChange();
+          this.labelCache = null;
+          this.labelCachePromise = null;
+        }
         this.emailCache.clear();
         this.respawnEmailNPCs()
           .then(() => this.startBackgroundPolling())
@@ -1420,9 +1487,10 @@ class VillageScene extends Phaser.Scene {
         const away = (e: MouseEvent) => {
           if (popover.contains(e.target as Node)) return;
           popover.remove();
-          document.removeEventListener('mousedown', away, true);
         };
         document.addEventListener('mousedown', away, true);
+        const origRemove = popover.remove.bind(popover);
+        popover.remove = () => { document.removeEventListener('mousedown', away, true); origRemove(); };
         search.focus();
       }, 0);
 
@@ -2306,9 +2374,10 @@ class VillageScene extends Phaser.Scene {
       const away = (e: MouseEvent) => {
         if (pop.contains(e.target as Node)) return;
         pop.remove();
-        document.removeEventListener('mousedown', away, true);
       };
       document.addEventListener('mousedown', away, true);
+      const origRemove = pop.remove.bind(pop);
+      pop.remove = () => { document.removeEventListener('mousedown', away, true); origRemove(); };
     }, 0);
 
     // Profile header: large avatar + name + email + unread count, styled
@@ -2672,9 +2741,10 @@ class VillageScene extends Phaser.Scene {
       const away = (e: MouseEvent) => {
         if (pop.contains(e.target as Node)) return;
         pop.remove();
-        document.removeEventListener('mousedown', away, true);
       };
       document.addEventListener('mousedown', away, true);
+      const origRemove = pop.remove.bind(pop);
+      pop.remove = () => { document.removeEventListener('mousedown', away, true); origRemove(); };
     }, 0);
   }
 
@@ -2775,9 +2845,10 @@ class VillageScene extends Phaser.Scene {
       const away = (e: MouseEvent) => {
         if (pop.contains(e.target as Node)) return;
         pop.remove();
-        document.removeEventListener('mousedown', away, true);
       };
       document.addEventListener('mousedown', away, true);
+      const origRemove = pop.remove.bind(pop);
+      pop.remove = () => { document.removeEventListener('mousedown', away, true); origRemove(); };
     }, 0);
   }
 

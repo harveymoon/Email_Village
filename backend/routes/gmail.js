@@ -100,7 +100,11 @@ router.get('/buildings', (_req, res) => {
   res.json(out);
 });
 
-router.put('/buildings/:id', (req, res) => {
+// Write routes for gameplay state require requireAuth — they mutate
+// user-owned local data. Reads are intentionally open (already on
+// localhost; matches the /sync-status precedent) so the bottom status
+// bar can poll without re-checking session every 2s.
+router.put('/buildings/:id', requireAuth, (req, res) => {
   const id = parseInt(req.params.id, 10);
   if (!Number.isFinite(id)) return res.status(400).json({ error: 'building id must be numeric' });
   const { customName, labels } = req.body || {};
@@ -113,21 +117,21 @@ router.put('/buildings/:id', (req, res) => {
 
 router.get('/avatars', (_req, res) => res.json(avatarsRepo.all()));
 
-router.put('/avatars/:email', (req, res) => {
+router.put('/avatars/:email', requireAuth, (req, res) => {
   const email = req.params.email;
   if (!email) return res.status(400).json({ error: 'email required' });
   avatarsRepo.upsert(email, req.body || {});
   res.json({ success: true, avatar: avatarsRepo.get(email) });
 });
 
-router.delete('/avatars/:email', (req, res) => {
+router.delete('/avatars/:email', requireAuth, (req, res) => {
   avatarsRepo.remove(req.params.email);
   res.json({ success: true });
 });
 
 router.get('/people-overrides', (_req, res) => res.json(peopleOverridesRepo.all()));
 
-router.put('/people-overrides/:email', (req, res) => {
+router.put('/people-overrides/:email', requireAuth, (req, res) => {
   const email = req.params.email;
   if (!email) return res.status(400).json({ error: 'email required' });
   peopleOverridesRepo.upsert(email, req.body || {});

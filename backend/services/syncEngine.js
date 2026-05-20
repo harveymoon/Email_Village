@@ -373,9 +373,14 @@ async function pollHistoryFor(email, client) {
     } catch (err) {
       // 404 here means startHistoryId aged out of Gmail's window (~7d).
       // Safest recovery: re-run backfill, which resyncs everything
-      // and resets historyId to the current one.
+      // and resets historyId to the current one. CRITICAL: clear the
+      // stale history_id BEFORE invoking backfill — without that, the
+      // 60s history poll keeps using the same stale id and hits 404
+      // again on every tick until backfill finishes writing a new one
+      // (potentially minutes of wasted quota + log spam).
       if (err.code === 404 || /historyId/i.test(err.message || '')) {
         console.warn(`[sync] ${email}: history too old, falling back to backfill`);
+        accountsRepo.setHistoryId(email, null);
         accountsRepo.markBackfillStart(email, null);
         await backfillAccount(email, client);
       } else if (err.message?.includes('invalid_grant')) {

@@ -16,7 +16,7 @@
 
 import { google } from 'googleapis';
 import { getAllAuthenticatedClients, reportInvalidGrant } from '../routes/auth.js';
-import { threadsRepo, mutationQueueRepo } from '../db/repositories.js';
+import { threadsRepo, mutationQueueRepo, atomicMutations } from '../db/repositories.js';
 import { gmailLimiter } from './rateLimiter.js';
 
 const DRAIN_TICK_MS = 1000;
@@ -36,28 +36,24 @@ function gmail(client) {
 
 /**
  * Apply a label modification to the local thread + enqueue the Gmail
- * call. `threadId` is the prefixed form ("<account>:<gmailThreadId>").
+ * call IN A SINGLE TRANSACTION. If anything fails between the local
+ * apply and the queue insert, both roll back together — the UI never
+ * shows a state that doesn't have a matching pending sync to Gmail.
+ *
+ * `threadId` is the prefixed form ("<account>:<gmailThreadId>").
  * `addRawIds` and `removeRawIds` are Gmail raw label IDs (system or
  * Label_xxx) — the same shape Gmail's threads.modify accepts.
  */
 export function applyAndEnqueueModify(threadId, addRawIds, removeRawIds) {
-  // Local-first apply. Same surgical logic the old patchLocalThreadLabels
-  // helper used to do in the renderer.
-  threadsRepo.applyLabelDelta(threadId, addRawIds || [], removeRawIds || []);
-  if ((removeRawIds || []).includes('UNREAD')) threadsRepo.setReadFlag(threadId, true);
-  if ((addRawIds || []).includes('UNREAD')) threadsRepo.setReadFlag(threadId, false);
-  mutationQueueRepo.enqueueModify(threadId, addRawIds, removeRawIds);
+  atomicMutations.modify(threadId, addRawIds, removeRawIds);
 }
 
 /**
- * Mark a thread read/unread locally + enqueue the Gmail call. Distinct
- * from modify because Gmail uses messages.modify when you want every
- * message in a thread to flip UNREAD — threads.modify works too and is
- * what we use here for simplicity.
+ * Mark a thread read/unread locally + enqueue the Gmail call as a
+ * single transaction (see applyAndEnqueueModify for the rationale).
  */
 export function applyAndEnqueueMarkRead(threadId, isRead) {
-  threadsRepo.setReadFlag(threadId, isRead);
-  mutationQueueRepo.enqueueMarkRead(threadId, isRead);
+  atomicMutations.markRead(threadId, isRead);
 }
 
 // ---------------- drain worker ----------------

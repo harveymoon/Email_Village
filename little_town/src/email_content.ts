@@ -429,14 +429,25 @@ function openMoveMenu(anchor: HTMLElement, t: EmailThread, opts: OpenEmailPopupO
   // closing, which would otherwise prevent this handler from firing
   // when the user clicks anywhere inside the modal body. Capture runs
   // before bubble, so we see all clicks regardless.
+  //
+  // Cleanup is wired through a menu.remove() override so EVERY call
+  // path that destroys the popover — outside-click, destination-pick,
+  // external close — also removes the document listener. Without the
+  // override, picking a destination called .remove() without removing
+  // `away`, leaving an orphaned listener on document for the rest of
+  // the session.
   setTimeout(() => {
     const away = (e: MouseEvent) => {
       if (menu.contains(e.target as Node)) return;
-      if (e.target === anchor) return;        // anchor click is handled by openMoveMenu's toggle path
+      if (e.target === anchor) return;
       menu.remove();
-      document.removeEventListener('mousedown', away, true);
     };
     document.addEventListener('mousedown', away, true);
+    const origRemove = menu.remove.bind(menu);
+    menu.remove = () => {
+      document.removeEventListener('mousedown', away, true);
+      origRemove();
+    };
   }, 0);
 }
 

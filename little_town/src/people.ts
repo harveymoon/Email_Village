@@ -106,6 +106,16 @@ export async function hydratePeopleOverrides(): Promise<void> {
   await hydrateOnce();
 }
 
+/**
+ * Wipe the in-memory people-overrides cache + force re-fetch on next
+ * use. Called on account switch so Account A's display-name / notes
+ * overrides don't bleed into Account B's UI.
+ */
+export function resetPeopleOverridesForAccountChange(): void {
+  cache.clear();
+  hydrating = null;
+}
+
 export function loadOverrides(): Record<string, PersonOverride> {
   // Object.fromEntries on the cache gives every caller a fresh-looking
   // map without leaking the Map reference.

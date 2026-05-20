@@ -128,6 +128,17 @@ export async function hydrateAvatars(): Promise<void> {
   await hydrateOnce();
 }
 
+/**
+ * Wipe the in-memory avatar cache and force the next call to re-fetch
+ * from /api/avatars. Called when the user signs out / signs in as a
+ * different account — without this, Account A's avatars stay cached in
+ * memory and incorrectly render when Account B's NPCs spawn.
+ */
+export function resetAvatarsForAccountChange(): void {
+  cache.clear();
+  hydrating = null;
+}
+
 export function saveAvatar(email: string, cfg: AvatarConfig): void {
   const key = email.toLowerCase();
   // Skip the write + the event dispatch entirely if the config didn't

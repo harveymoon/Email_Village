@@ -641,3 +641,26 @@ export const mutationQueueRepo = {
   remove: (id) => queueStmts.remove.run(id),
   countPending: () => queueStmts.countPending.get().n,
 };
+
+// Atomic write-through: apply the local state change AND enqueue the
+// matching Gmail mutation in a single SQLite transaction. If the
+// transaction is interrupted (process crash, disk error), the rollback
+// leaves both the thread state AND the queue untouched — no divergence
+// between what the UI shows and what's pending push to Gmail.
+//
+// Used by the route handlers in routes/gmail.js — they call these
+// directly instead of separately invoking threadsRepo.* + queue.* like
+// the pre-Phase-G code did.
+
+export const atomicMutations = {
+  modify: db.transaction((threadId, addRawIds, removeRawIds) => {
+    threadsRepo.applyLabelDelta(threadId, addRawIds || [], removeRawIds || []);
+    if ((removeRawIds || []).includes('UNREAD')) threadsRepo.setReadFlag(threadId, true);
+    if ((addRawIds || []).includes('UNREAD')) threadsRepo.setReadFlag(threadId, false);
+    mutationQueueRepo.enqueueModify(threadId, addRawIds, removeRawIds);
+  }),
+  markRead: db.transaction((threadId, isRead) => {
+    threadsRepo.setReadFlag(threadId, isRead);
+    mutationQueueRepo.enqueueMarkRead(threadId, isRead);
+  }),
+};

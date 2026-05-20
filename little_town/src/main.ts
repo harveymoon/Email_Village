@@ -3020,10 +3020,15 @@ class VillageScene extends Phaser.Scene {
         bySender.get(email)!.threads.push(t);
       }
       // Spawn in parallel — composeAndRegisterAvatar caches by config
-      // hash so duplicate work across NPCs is shared.
+      // hash so duplicate work across NPCs is shared. crowdSize is
+      // shared across the batch so every NPC at this building gets the
+      // same wander territory (proportional to the total NPC count
+      // here), preventing the Post Office mosh-pit when one label has
+      // 400+ unread senders.
+      const crowdSize = bySender.size;
       await Promise.all(
         [...bySender.entries()].map(([email, group]) =>
-          this.spawnPersonNPC(b, door, email, group.name, group.threads)
+          this.spawnPersonNPC(b, door, email, group.name, group.threads, crowdSize)
         )
       );
       // Per-building diagnostic: which senders ended up here, with
@@ -3048,7 +3053,7 @@ class VillageScene extends Phaser.Scene {
   // Spawn a single NPC for one sender at this building, carrying all
   // their unread thread ids. Wander is constrained to the building's
   // rect + a small padding so each NPC stays close to home.
-  private async spawnPersonNPC(building: Building, door: Door, fromEmail: string, fromName: string, threads: EmailThread[]): Promise<void> {
+  private async spawnPersonNPC(building: Building, door: Door, fromEmail: string, fromName: string, threads: EmailThread[], crowdSize = 1): Promise<void> {
     // Spawn EXACTLY at the door tile's center — not a random scatter
     // around the door's pixel position. The pixel position can sit
     // close to (or just inside) a solid building tile, causing the
@@ -3078,6 +3083,16 @@ class VillageScene extends Phaser.Scene {
       snippet: t.snippet || '',
       date: t.date || '',
     }));
+    // Wander territory scales with how crowded this building is. Each
+    // NPC wants roughly π·r² ≈ N·SPACING tiles to wander; solving for
+    // r gives sqrt(N·SPACING/π) ≈ sqrt(N)·0.8 (with SPACING=2). The
+    // max(3, …) keeps small buildings looking lived-in instead of
+    // pinned to the door. The cap of 18 keeps very crowded buildings
+    // (like the INBOX-bound Post Office with hundreds of senders) from
+    // wandering halfway across the map. maxWanderTiles scales too so
+    // an NPC at the outer edge can actually walk somewhere.
+    const homeRadius = Math.min(18, Math.max(3, Math.ceil(Math.sqrt(crowdSize) * 0.85)));
+    const maxWanderTiles = Math.min(8, Math.max(3, Math.ceil(homeRadius / 2)));
     const npc = new NPC(this, this.grid, this.doors, { x: spawnX, y: spawnY }, textureKey, {
       data: {
         fromName, fromEmail,
@@ -3087,7 +3102,8 @@ class VillageScene extends Phaser.Scene {
       },
       homeDoor: door,
       homeBounds: { x: building.x, y: building.y, w: building.w, h: building.h },
-      homeRadius: 3,
+      homeRadius,
+      maxWanderTiles,
     });
     if (this.backgroundLayer)    this.physics.add.collider(npc.sprite, this.backgroundLayer);
     if (this.groundObjectsLayer) this.physics.add.collider(npc.sprite, this.groundObjectsLayer);

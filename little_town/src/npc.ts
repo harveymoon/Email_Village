@@ -360,7 +360,11 @@ export class NPC {
     const dx1 = Math.min(this.grid.cols - 1, this.homeDoor.tx + r);
     const dy1 = Math.min(this.grid.rows - 1, this.homeDoor.ty + r);
 
-    for (let attempt = 0; attempt < 16; attempt++) {
+    // Attempt count scales with the sample area so a larger wander
+    // territory (crowded building) doesn't keep failing to find a
+    // walkable tile in 16 tries when 80%+ of the rect is buildings.
+    const attemptCap = Math.min(64, Math.max(16, r * 4));
+    for (let attempt = 0; attempt < attemptCap; attempt++) {
       const tx = dx0 + Math.floor(Math.random() * (dx1 - dx0 + 1));
       const ty = dy0 + Math.floor(Math.random() * (dy1 - dy0 + 1));
       if (tx === sx && ty === sy) continue;

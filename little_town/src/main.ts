@@ -3288,7 +3288,6 @@ class VillageScene extends Phaser.Scene {
   // the building, off-screen). Future Phase 8 will respawn it as a
   // read-state-less indoor occupant.
   async moveThread(threadId: string, destLabelId: string, destBuildingName: string, overrideLabel?: string): Promise<void> {
-    console.log(`[move] thread=${threadId} → ${destBuildingName} (${destLabelId})${overrideLabel ? ` floor=${overrideLabel}` : ''}`);
     setStatus(`Moving to ${destBuildingName}…`, { tone: 'info', ttlMs: 8000 });
     // Resolve destination: either a `building:<id>` token (new multi-label
     // shape from destinationsForMove), or a plain label name (legacy).
@@ -3331,10 +3330,8 @@ class VillageScene extends Phaser.Scene {
       alert(`Can't move to ${destBuildingName}: none of its labels exist in ${threadAccount}.\n\nAdd a label that exists in this account to that building first.`);
       return;
     }
-    console.log(`[move] thread ${threadId} → "${chosen}" (from ${candidateLabels.length} candidates) on ${threadAccount}`);
-
-    const modifyResult = await api.modify(threadId, [chosen], ['INBOX']);
-    console.log(`[move] backend confirmed`, modifyResult);
+    console.log(`[move] 1 thread → ${destBuildingName} (label: ${chosen})`);
+    await api.modify(threadId, [chosen], ['INBOX']);
     setStatus(`Moved to ${destBuildingName}${overrideLabel && overrideLabel !== chosen ? ` / ${overrideLabel}` : ''}`, { tone: 'ok' });
     // Patch any in-memory copies of this thread BEFORE blowing the
     // cache away — open popups (e.g. the person profile) hold direct
@@ -4318,7 +4315,14 @@ class VillageScene extends Phaser.Scene {
   // the texture on every NPC whose data.fromEmail matches. Called from
   // the `avatar:updated` listener so edits in any open customizer
   // appear on the in-world sprite immediately. No-ops if there's no
-  // matching NPC right now.
+  // matching NPC right now — and (crucially) no-ops without any log
+  // spam if the composed texture key is the SAME as what the sprites
+  // are already wearing, which is the common case when this handler
+  // fires from a side-effect of NPC spawn (ensureAvatar patched in a
+  // missing layer, fired avatar:updated, the listener re-runs the
+  // pipeline and gets the same hash back). The previous unconditional
+  // setTexture + log made it look like avatars were churning when
+  // nothing visible had changed.
   private async refreshNpcsForEmail(email: string): Promise<void> {
     const lower = email.toLowerCase();
     const matching = this.npcs.filter(n => {
@@ -4327,14 +4331,19 @@ class VillageScene extends Phaser.Scene {
     });
     if (!matching.length) return;
     const cfg = await ensureAvatar(email);
-    const textureKey = await composeAndRegisterAvatar(this, cfg);
+    const newTextureKey = await composeAndRegisterAvatar(this, cfg);
+    let actuallyChanged = 0;
     for (const npc of matching) {
-      npc.sprite.setTexture(textureKey, AVATAR_FRAMES.idleDown);
+      if (npc.sprite.texture.key === newTextureKey) continue;
+      npc.sprite.setTexture(newTextureKey, AVATAR_FRAMES.idleDown);
       // charKey drives anim key lookups (`${charKey}-walk-down` etc.),
       // so it has to swap too or the NPC will play stale animations.
-      (npc as any).charKey = textureKey;
+      (npc as any).charKey = newTextureKey;
+      actuallyChanged++;
     }
-    console.log(`[avatar:updated] swapped ${matching.length} NPC texture(s) for ${email} → ${textureKey}`);
+    if (actuallyChanged > 0) {
+      console.log(`[avatar] applied new look to ${actuallyChanged} NPC${actuallyChanged === 1 ? '' : 's'} for ${email}`);
+    }
   }
 
   private snapPlayerToPostOfficeDoor(map: Phaser.Tilemaps.Tilemap): void {

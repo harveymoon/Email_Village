@@ -120,16 +120,12 @@ export class ThreadCache {
         : labels.find(l => l.account === account && l.name === n)?.rawId)
         .filter((v): v is string => !!v),
     );
-    let patched = 0;
     const apply = (t: EmailThread) => {
       if (t.threadId !== threadId) return;
-      const before = t.labels.length;
       t.labels = t.labels.filter(rid => !removeRawSet.has(rid));
       if (addRaw && !t.labels.includes(addRaw)) t.labels.push(addRaw);
-      if (t.labels.length !== before || t.labels.includes(addRaw || '')) patched++;
     };
     for (const arr of this.cache.values()) for (const t of arr) apply(t);
-    if (patched > 0) console.log(`[move] patched labels on ${patched} cached thread copies`);
     // Notify any open UI that holds its own thread references (e.g.
     // the person profile popup includes threads it fetched fresh from
     // /api/threads/:id — those never lived in the cache so the loop
@@ -239,7 +235,7 @@ export class ThreadCache {
       }
     }
 
-    console.log(`[move-bulk] patched ${patchedCount} cached thread copies across ${threadIds.length} ids → ${addName}`);
+    console.log(`[move] ${threadIds.length} threads → ${addName} (cache updated, ${patchedCount} copies patched)`);
     try {
       document.dispatchEvent(new CustomEvent('thread:labels-updated', {
         detail: { threadIds, addedRawId: addRaw || null, removedRawIds: [...removeRawSet], bulk: true },

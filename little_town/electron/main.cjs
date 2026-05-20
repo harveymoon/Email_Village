@@ -164,6 +164,29 @@ function waitForBackend(timeoutMs = 30_000) {
 /** @type {BrowserWindow | null} */
 let mainWindow = null;
 
+// Renderer-side log file. Captures everything that lands in the
+// renderer's devtools console (via the console-message event) plus
+// any render-process-gone / unresponsive / preload-error events from
+// Electron itself, so when the window goes black we have a paper
+// trail describing what the renderer was doing right before it died.
+// Lives next to backend.log in userData. Rotates on each launch.
+/** @type {fs.WriteStream | null} */
+let rendererLogStream = null;
+function rendererLog(line) {
+  if (!rendererLogStream) return;
+  try { rendererLogStream.write(`${new Date().toISOString()} ${line}\n`); } catch { /* fine */ }
+}
+function openRendererLog() {
+  const logDir = app.getPath('userData');
+  fs.mkdirSync(logDir, { recursive: true });
+  const current = path.join(logDir, 'renderer.log');
+  const prev = path.join(logDir, 'renderer-prev.log');
+  try { if (fs.existsSync(current)) fs.renameSync(current, prev); } catch { /* fine */ }
+  rendererLogStream = fs.createWriteStream(current, { flags: 'a' });
+  rendererLogStream.write(`\n=== renderer spawn ${new Date().toISOString()} ===\n`);
+  console.log('[main] renderer log:', current);
+}
+
 function createMainWindow() {
   // Icon path: in packaged builds electron-packager bakes the icon
   // into the .exe metadata via --icon, but we also pass it to
@@ -192,6 +215,52 @@ function createMainWindow() {
 
   mainWindow.once('ready-to-show', () => mainWindow?.show());
   mainWindow.on('closed', () => { mainWindow = null; });
+
+  // --- Renderer diagnostics ---
+  // Forward every console line from the renderer to renderer.log so we
+  // have a paper trail even after the window blanks. Console levels:
+  //   0=verbose 1=info 2=warning 3=error
+  const wc = mainWindow.webContents;
+  const LEVELS = ['VERBOSE', 'INFO', 'WARN', 'ERROR'];
+  wc.on('console-message', (_event, level, message, line, sourceId) => {
+    const tag = LEVELS[level] || `LVL${level}`;
+    const src = sourceId ? ` (${path.basename(sourceId)}:${line})` : '';
+    rendererLog(`[console:${tag}] ${message}${src}`);
+  });
+  // The big one: the renderer process died (OOM / GPU hang / crash).
+  // `details.reason` is one of: clean-exit / abnormal-exit /
+  //   killed / crashed / oom / launch-failed / integrity-failure.
+  wc.on('render-process-gone', (_event, details) => {
+    const msg = `[render-process-gone] reason=${details.reason} exitCode=${details.exitCode}`;
+    rendererLog(msg);
+    console.error('[main]', msg);
+    // Try to revive automatically — useful when the user clicks a
+    // triage button that pushes the renderer OOM; one reload usually
+    // gets the world back without losing backend state.
+    if (details.reason === 'crashed' || details.reason === 'oom') {
+      rendererLog('[render-process-gone] auto-reloading window');
+      try { mainWindow?.reload(); } catch (err) { rendererLog(`[render-process-gone] reload threw: ${err}`); }
+    }
+  });
+  // Renderer's main thread blocked >30s. Doesn't mean crashed yet, but
+  // black screen always precedes this so capturing it points the finger
+  // at the responsible task.
+  wc.on('unresponsive', () => {
+    rendererLog('[unresponsive] renderer main thread blocked');
+    console.warn('[main] renderer unresponsive');
+  });
+  wc.on('responsive', () => {
+    rendererLog('[responsive] renderer main thread back');
+  });
+  // Preload script failed to load — usually a typo or missing module.
+  wc.on('preload-error', (_event, preloadPath, error) => {
+    rendererLog(`[preload-error] ${preloadPath}: ${error?.stack || error}`);
+    console.error('[main] preload-error:', preloadPath, error);
+  });
+  // Renderer-side hard errors that bubble past window.onerror.
+  wc.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
+    rendererLog(`[did-fail-load] url=${validatedURL} code=${errorCode} ${errorDescription}`);
+  });
 
   // Route external http(s) navigation to the OS browser instead of
   // letting it replace our renderer. Unsubscribe links, OAuth pages,
@@ -294,6 +363,7 @@ if (!gotLock) {
   });
 
   app.whenReady().then(() => {
+    openRendererLog();
     startBackend();
     buildMenu();
     createMainWindow();

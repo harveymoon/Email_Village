@@ -19,6 +19,9 @@ import { composeAndRegisterAvatar, AVATAR_FRAMES } from './avatar_texture';
 import { mountStatusBar, setStatus } from './status_bar';
 import { openDestinationPicker } from './ui/destination_picker';
 import { openInboxTriage } from './ui/inbox_triage';
+import { installCrashDiagnostics, timed } from './diagnostics';
+
+installCrashDiagnostics();
 import {
   computeMoveSuggestions as computeMoveSuggestionsPure,
   rulesMatchingSender as rulesMatchingSenderPure,
@@ -2329,14 +2332,16 @@ class VillageScene extends Phaser.Scene {
           return 0;
         }
         setStatus(`Bulk moving ${email}'s INBOX → ${destBuildingName}…`, { tone: 'info', ttlMs: 10000 });
-        const result = await api.inboxBulkMove(email, account, [chosen], ['INBOX']);
+        const result = await timed(`triage.bulkMove(${email})`, () => api.inboxBulkMove(email, account, [chosen], ['INBOX']));
         // ONE pass over every cached label slot to patch + filter every
         // moved id at once. The naive per-id loop here was O(N×K): for
         // 254 ids × ~10k cached threads = 10M operations + 254 events +
         // 254 console.logs on the main thread, which froze the renderer
         // long enough that Electron blanked the window. bulkPatchAndMove
         // collapses it to ~O(N + K).
-        this.threadCache.bulkPatchAndMove(result.threadIds, chosen, ['INBOX'], account);
+        timed(`triage.patchCache(${result.threadIds.length} ids)`, () =>
+          this.threadCache.bulkPatchAndMove(result.threadIds, chosen, ['INBOX'], account),
+        );
         // Defer the heavy side-effects (per-building unread refresh hits
         // /api/unread-count for every labeled building; respawnEmailNPCs
         // destroys + rebuilds every NPC sprite) so the click feels
@@ -2344,20 +2349,25 @@ class VillageScene extends Phaser.Scene {
         // in Electron's renderer for plain HTML pages without a flag.
         setStatus(`Moved ${result.moved} from ${email} to ${destBuildingName}`, { tone: 'ok' });
         setTimeout(() => {
-          this.refreshBuildingUnreadCounts().catch(err => console.warn('[triage] badge refresh failed', err));
-          this.respawnEmailNPCs().catch(err => console.warn('[triage] NPC respawn failed', err));
+          timed('triage.refreshBuildingCounts', () => this.refreshBuildingUnreadCounts())
+            .catch(err => console.warn('[triage] badge refresh failed', err));
+          timed('triage.respawnNPCs', () => this.respawnEmailNPCs())
+            .catch(err => console.warn('[triage] NPC respawn failed', err));
         }, 50);
         return result.moved;
       },
       markAllReadForSender: async (email, account) => {
         setStatus(`Bulk marking ${email}'s INBOX read…`, { tone: 'info', ttlMs: 8000 });
-        const result = await api.inboxBulkMarkRead(email, account);
-        // Single O(K) pass to flip isRead on every cached copy.
-        this.threadCache.bulkMarkRead(result.threadIds);
+        const result = await timed(`triage.bulkMarkRead(${email})`, () => api.inboxBulkMarkRead(email, account));
+        timed(`triage.markReadCache(${result.threadIds.length} ids)`, () =>
+          this.threadCache.bulkMarkRead(result.threadIds),
+        );
         setStatus(`Marked ${result.marked} read from ${email}`, { tone: 'ok' });
         setTimeout(() => {
-          this.refreshBuildingUnreadCounts().catch(err => console.warn('[triage] badge refresh failed', err));
-          this.respawnEmailNPCs().catch(err => console.warn('[triage] NPC respawn failed', err));
+          timed('triage.refreshBuildingCounts', () => this.refreshBuildingUnreadCounts())
+            .catch(err => console.warn('[triage] badge refresh failed', err));
+          timed('triage.respawnNPCs', () => this.respawnEmailNPCs())
+            .catch(err => console.warn('[triage] NPC respawn failed', err));
         }, 50);
         return result.marked;
       },

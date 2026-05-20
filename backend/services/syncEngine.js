@@ -38,6 +38,23 @@ export async function backfillAccount(email, client) {
   if (backfillsInFlight.has(email)) return backfillsInFlight.get(email);
   const promise = (async () => {
     const g = gmail(client);
+    // If a previous run completed the count (done >= total) but
+    // crashed before marking last_full_sync_at, treat that as done
+    // and skip the full re-walk. Saves ~25min on a 69k-thread inbox.
+    const existing = accountsRepo.get(email);
+    if (existing?.backfill_total && existing.backfill_done >= existing.backfill_total) {
+      console.log(`[sync] ${email}: previous backfill reached ${existing.backfill_done}/${existing.backfill_total}, finalising`);
+      try {
+        await gmailLimiter.take(1);
+        const prof = await g.users.getProfile({ userId: 'me' });
+        accountsRepo.markBackfillComplete(email, prof.data.historyId);
+        console.log(`[sync] ${email}: marked complete, historyId=${prof.data.historyId}`);
+        return true;
+      } catch (err) {
+        console.warn(`[sync] ${email}: finalisation failed, will full-resync next time:`, err.message);
+        // Fall through to a full backfill below.
+      }
+    }
     console.log(`[sync] backfill start: ${email}`);
 
     // Capture a baseline historyId BEFORE we list anything. Using the

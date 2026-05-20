@@ -21,6 +21,7 @@
 const { app, BrowserWindow, Menu, shell, ipcMain } = require('electron');
 const path = require('node:path');
 const http = require('node:http');
+const fs = require('node:fs');
 const { spawn } = require('node:child_process');
 
 const IS_DEV = !!process.env.TOWN_INBOX_DEV;
@@ -73,6 +74,18 @@ function startBackend() {
     ? path.join(process.resourcesPath, 'dist')
     : path.join(__dirname, '..', 'dist');
 
+  // Set up a per-launch log file in userData so the next crash leaves
+  // a paper trail (the packaged app's stdout goes nowhere when
+  // launched by double-click). Rotates to a fresh file each launch;
+  // previous launches stay around as backend-prev.log.
+  const logDir = app.getPath('userData');
+  fs.mkdirSync(logDir, { recursive: true });
+  const currentLog = path.join(logDir, 'backend.log');
+  const prevLog = path.join(logDir, 'backend-prev.log');
+  try { if (fs.existsSync(currentLog)) fs.renameSync(currentLog, prevLog); } catch { /* fine */ }
+  const logStream = fs.createWriteStream(currentLog, { flags: 'a' });
+  logStream.write(`\n=== backend spawn ${new Date().toISOString()} (pid pending) ===\n`);
+
   backendProc = spawn(process.execPath, [entry], {
     env: {
       ...process.env,
@@ -90,11 +103,27 @@ function startBackend() {
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  backendProc.stdout?.on('data', (chunk) => process.stdout.write(`[backend] ${chunk}`));
-  backendProc.stderr?.on('data', (chunk) => process.stderr.write(`[backend ERR] ${chunk}`));
+  logStream.write(`(pid=${backendProc.pid})\n`);
+  backendProc.stdout?.on('data', (chunk) => { process.stdout.write(`[backend] ${chunk}`); logStream.write(chunk); });
+  backendProc.stderr?.on('data', (chunk) => { process.stderr.write(`[backend ERR] ${chunk}`); logStream.write(`[ERR] ${chunk}`); });
   backendProc.on('exit', (code, signal) => {
-    console.warn(`[main] backend exited code=${code} signal=${signal}`);
+    const msg = `[main] backend exited code=${code} signal=${signal} at ${new Date().toISOString()}`;
+    console.warn(msg);
+    logStream.write(`\n${msg}\n`);
+    logStream.end();
     backendProc = null;
+    // If the renderer's already running, show the user a banner so
+    // they don't sit there wondering why nothing responds.
+    if (mainWindow) {
+      mainWindow.webContents.executeJavaScript(`(() => {
+        const old = document.getElementById('__backend-died-banner'); if (old) old.remove();
+        const div = document.createElement('div');
+        div.id = '__backend-died-banner';
+        div.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:9999;background:#5a1a1a;color:#fff;padding:10px 16px;font:13px system-ui;text-align:center;';
+        div.textContent = 'Backend process exited (code=${code}). Check ${currentLog.replace(/\\\\/g, '\\\\\\\\')} for the crash log, then re-launch.';
+        document.body.appendChild(div);
+      })();`).catch(() => { /* renderer might be gone too */ });
+    }
   });
 }
 

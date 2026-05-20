@@ -22,6 +22,22 @@ const __dirname = path.dirname(__filename);
 // OAuth client unconfigured.
 dotenv.config({ path: path.join(__dirname, '.env') });
 
+// Crash visibility: in the packaged app there's nowhere obvious for an
+// unhandled rejection to surface — the process just dies and the
+// renderer keeps an already-loaded page. Log loudly to stderr (which
+// the parent Electron main pipes to backend.log) before exit, and
+// keep the process alive on rejections so background sync hiccups
+// don't take the whole server down.
+process.on('uncaughtException', (err) => {
+  console.error('[fatal] uncaughtException:', err?.stack || err);
+  // Letting this propagate would terminate the process. Keep alive —
+  // the offending request will 500, but the queue / sync engine
+  // survive to retry.
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[fatal] unhandledRejection:', reason?.stack || reason);
+});
+
 const app = express();
 // Default 3091 — picked to avoid the very-common :3000 (used by CRA,
 // Express scaffolds, lots of other tools). Override via PORT env var.

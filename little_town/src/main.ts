@@ -15,6 +15,12 @@ import { openRulesPane, openRuleEditor, summarizeRuleCriteria, summarizeRuleActi
 import { openPeopleGrid, openPersonPopup, openAvatarCustomizer } from './people_ui';
 import { avatarPortraitForEmail, ensureAvatar, randomAvatar, saveAvatar } from './avatar';
 import { composeAndRegisterAvatar, AVATAR_FRAMES } from './avatar_texture';
+import { mountStatusBar, setStatus } from './status_bar';
+
+// Mount the bottom status bar as soon as this module loads — Phaser
+// boot can take a beat and we want the bar visible before any
+// fetching starts.
+mountStatusBar();
 
 let cursors: Phaser.Types.Input.Keyboard.CursorKeys;
 let player: Phaser.Types.Physics.Arcade.SpriteWithDynamicBody;
@@ -3345,15 +3351,18 @@ class VillageScene extends Phaser.Scene {
     if (this.isRefreshing) return;
     this.isRefreshing = true;
     if (!silent) this.showRefreshToast('Refreshing inbox…');
+    setStatus('Refreshing inbox…', { tone: 'info', ttlMs: 0 });
     this.emailCache.clear();
     this.emailFetchPromises.clear();
     try {
       await this.respawnEmailNPCs();
       this.lastInboxCount = await this.fetchInboxUnreadCount();
       if (!silent) this.showRefreshToast(`Refreshed. ${this.npcs.length} NPCs from ${this.lastInboxCount ?? '?'} inbox unread.`, 'ok');
+      setStatus(`Refreshed. ${this.npcs.length} NPCs, ${this.lastInboxCount ?? '?'} unread.`, { tone: 'ok' });
     } catch (err) {
       console.warn('[refresh] failed', err);
       if (!silent) this.showRefreshToast(`Refresh failed: ${err}`, 'err');
+      setStatus(`Refresh failed: ${err}`, { tone: 'err', ttlMs: 6000 });
     } finally {
       this.isRefreshing = false;
     }
@@ -3570,6 +3579,7 @@ class VillageScene extends Phaser.Scene {
       }
     }
     api.markRead(t.threadId, true).catch(err => console.warn('[markRead] failed', err));
+    setStatus(`Marked read: ${t.subject?.slice(0, 60) || '(no subject)'}`, { tone: 'ok' });
   }
 
   // Apply the destination label to the thread + archive it (remove
@@ -3581,6 +3591,7 @@ class VillageScene extends Phaser.Scene {
   // read-state-less indoor occupant.
   async moveThread(threadId: string, destLabelId: string, destBuildingName: string, overrideLabel?: string): Promise<void> {
     console.log(`[move] thread=${threadId} → ${destBuildingName} (${destLabelId})${overrideLabel ? ` floor=${overrideLabel}` : ''}`);
+    setStatus(`Moving to ${destBuildingName}…`, { tone: 'info', ttlMs: 8000 });
     // Resolve destination: either a `building:<id>` token (new multi-label
     // shape from destinationsForMove), or a plain label name (legacy).
     let destBuilding: Building | undefined;
@@ -3626,6 +3637,7 @@ class VillageScene extends Phaser.Scene {
 
     const modifyResult = await api.modify(threadId, [chosen], ['INBOX']);
     console.log(`[move] backend confirmed`, modifyResult);
+    setStatus(`Moved to ${destBuildingName}${overrideLabel && overrideLabel !== chosen ? ` / ${overrideLabel}` : ''}`, { tone: 'ok' });
     // Patch any in-memory copies of this thread BEFORE blowing the
     // cache away — open popups (e.g. the person profile) hold direct
     // references to those thread objects and the next render needs to

@@ -12,7 +12,7 @@ import express from 'express';
 import { google } from 'googleapis';
 import { requireAuth, dropAccountForInvalidGrant } from './auth.js';
 import { parseMessage, extractUnsubscribe } from '../gmail/parseMessage.js';
-import { labelsRepo, threadsRepo, messagesRepo, queryRepo } from '../db/repositories.js';
+import { labelsRepo, threadsRepo, messagesRepo, queryRepo, statusRepo } from '../db/repositories.js';
 import { applyAndEnqueueModify, applyAndEnqueueMarkRead } from '../services/mutationQueue.js';
 import { gmailLimiter } from '../services/rateLimiter.js';
 
@@ -73,6 +73,14 @@ function handleGmailError(err, res, action, account) {
 // parseMessage + extractUnsubscribe live in backend/gmail/parseMessage.js
 // so the sync engine and these legacy routes share one implementation.
 // See the import at the top.
+
+// ---------------- sync status (cheap, poll-friendly) ----------------
+// Renderer polls this every couple seconds to drive the bottom status
+// bar (backfill progress + mutation-queue depth). Pure SQL reads, no
+// auth check — anyone with localhost access already has the data.
+router.get('/sync-status', (_req, res) => {
+  res.json(statusRepo.snapshot());
+});
 
 // ---------------- profile (multi) ----------------
 router.get('/profile', requireAuth, async (req, res) => {

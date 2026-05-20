@@ -362,6 +362,34 @@ function hydrateThread(row) {
   };
 }
 
+// Snapshot of sync engine + queue state for the status-bar poll.
+const syncStatusStmts = {
+  accounts: db.prepare(`
+    SELECT email,
+           backfill_done   AS backfillDone,
+           backfill_total  AS backfillTotal,
+           last_full_sync_at AS lastFullSyncAt,
+           history_id      AS historyId
+      FROM accounts
+  `),
+  queuePending: db.prepare(`SELECT COUNT(*) AS n FROM mutation_queue WHERE status IN ('pending', 'inflight')`),
+  queueFailed: db.prepare(`SELECT COUNT(*) AS n FROM mutation_queue WHERE status = 'failed'`),
+};
+export const statusRepo = {
+  snapshot() {
+    const accounts = syncStatusStmts.accounts.all().map(a => ({
+      ...a,
+      complete: !!a.lastFullSyncAt,
+    }));
+    return {
+      accounts,
+      queuePending: syncStatusStmts.queuePending.get().n,
+      queueFailed: syncStatusStmts.queueFailed.get().n,
+      now: Date.now(),
+    };
+  },
+};
+
 export const queryRepo = {
   threadsByLabelName(name, { limit = 1000, offset = 0 } = {}) {
     return listStmts.byLabelName.all(name, name, limit, offset).map(hydrateThread);

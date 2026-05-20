@@ -11,6 +11,7 @@ import dotenv from 'dotenv';
 
 import authRoutes from './routes/auth.js';
 import gmailRoutes from './routes/gmail.js';
+import { bootstrapSync } from './services/syncEngine.js';
 
 dotenv.config();
 
@@ -90,6 +91,10 @@ app.listen(PORT, () => {
   if (!process.env.GOOGLE_CLIENT_ID) {
     console.log(`\n⚠️  Gmail not configured — set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in backend/.env`);
   }
+  // Kick off sync after auth.js has loaded its token store (which it
+  // does at import time). Run on next tick so the listen() callback's
+  // log line lands before the sync engine starts noisily logging.
+  setImmediate(() => bootstrapSync().catch(err => console.error('[sync] bootstrap failed:', err)));
 });
 
 export default app;

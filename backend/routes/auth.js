@@ -214,6 +214,12 @@ router.get('/callback', async (req, res) => {
       req.session.accounts = [emailKey];
     }
     console.log(`✅ Authenticated ${emailKey} (session now: ${req.session.accounts.join(', ')})`);
+    // Kick off backfill for the newly-authed account in the background.
+    // Lazy import to avoid the sync engine pulling in better-sqlite3
+    // during the OAuth route's first call (small startup-time win).
+    import('../services/syncEngine.js')
+      .then(({ kickoffBackfillFor }) => kickoffBackfillFor(emailKey))
+      .catch(err => console.warn('[auth] failed to kickoff backfill:', err.message));
     res.redirect(appendQuery(returnTo, 'auth_success=true'));
   } catch (err) {
     console.error('OAuth callback error:', err);
@@ -268,6 +274,29 @@ export function requireAuth(req, res, next) {
 // Helper for gmail.js: drop a single account if its refresh fails.
 export function dropAccountForInvalidGrant(email) {
   removeAccount((email || '').toLowerCase());
+}
+
+// Out-of-request helper for the sync engine. Returns an OAuth2Client
+// for every account whose tokens we have on disk — used by background
+// workers (backfill, history poll, mutation drain) that don't have a
+// req.session to pull from.
+export function getAllAuthenticatedClients() {
+  const out = {};
+  for (const email of Object.keys(store.accounts)) {
+    const entry = store.accounts[email];
+    if (!entry?.tokens?.access_token && !entry?.tokens?.refresh_token) continue;
+    const c = getOAuth2Client();
+    c.setCredentials(entry.tokens);
+    out[email] = c;
+  }
+  return out;
+}
+
+// Called by the sync engine if a background API call returns
+// invalid_grant — gives us the same auto-drop behaviour as the
+// per-request middleware.
+export function reportInvalidGrant(email) {
+  dropAccountForInvalidGrant(email);
 }
 
 export default router;

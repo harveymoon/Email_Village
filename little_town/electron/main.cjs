@@ -20,14 +20,15 @@
 
 const { app, BrowserWindow, Menu, shell, ipcMain } = require('electron');
 const path = require('node:path');
+const http = require('node:http');
 const { spawn } = require('node:child_process');
 
 const IS_DEV = !!process.env.TOWN_INBOX_DEV;
 const RENDERER_DEV_URL = 'http://localhost:5173/';
-// Resolved to dist/index.html relative to little_town/ in both dev (npm run
-// build then npm run electron:start) and packaged builds (electron-builder
-// stages the dist folder under app.asar/dist).
-const RENDERER_PROD_URL = `file://${path.join(__dirname, '..', 'dist', 'index.html')}`;
+
+// In packaged builds the renderer is served by our own Express
+// process at http://localhost:<BACKEND_PORT>/ (see backend/server.js).
+// Same-origin with the API means no CORS / cookie quirks vs file://.
 
 // Backend default port matches backend/server.js. Env override supported
 // so two simultaneous installs (e.g. dev + packaged) can coexist on one
@@ -64,6 +65,14 @@ function startBackend() {
   // Use the Electron-bundled Node runtime via process.execPath with the
   // ELECTRON_RUN_AS_NODE flag — saves us from needing a separate Node
   // install on the user's machine.
+  // Resolve the renderer dist dir for the backend's static-file
+  // server. In packaged builds we put dist/ in extraResources so
+  // Express can read it directly. In dev (electron:start without Vite),
+  // it sits next to electron/ at little_town/dist.
+  const rendererDir = app.isPackaged
+    ? path.join(process.resourcesPath, 'dist')
+    : path.join(__dirname, '..', 'dist');
+
   backendProc = spawn(process.execPath, [entry], {
     env: {
       ...process.env,
@@ -74,6 +83,10 @@ function startBackend() {
       // (~/.town-inbox) is the dev fallback used when running the
       // backend standalone (npm run dev).
       TOWN_INBOX_DATA_DIR: app.getPath('userData'),
+      // Tell the backend to serve the built renderer at the same
+      // origin as /api, so the window can load http://localhost:PORT/
+      // without CORS / cookie hassles.
+      TOWN_INBOX_RENDERER_DIR: rendererDir,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -90,6 +103,33 @@ function stopBackend() {
   console.log('[main] stopping backend');
   try { backendProc.kill('SIGTERM'); } catch { /* already gone */ }
   backendProc = null;
+}
+
+// Poll /health until the backend answers, OR `timeoutMs` elapses.
+// Used in production to make sure the renderer URL is loadable before
+// we hand it to BrowserWindow.loadURL — otherwise the window briefly
+// flashes a "ERR_CONNECTION_REFUSED" page before the server catches up.
+function waitForBackend(timeoutMs = 30_000) {
+  const start = Date.now();
+  return new Promise((resolve, reject) => {
+    const probe = () => {
+      const req = http.get({ host: '127.0.0.1', port: BACKEND_PORT, path: '/health', timeout: 1500 }, (res) => {
+        res.resume();
+        if (res.statusCode === 200) return resolve();
+        setTimeout(probe, 200);
+      });
+      req.on('error', () => {
+        if (Date.now() - start > timeoutMs) return reject(new Error('backend never came up'));
+        setTimeout(probe, 200);
+      });
+      req.on('timeout', () => {
+        req.destroy();
+        if (Date.now() - start > timeoutMs) return reject(new Error('backend never came up'));
+        setTimeout(probe, 200);
+      });
+    };
+    probe();
+  });
 }
 
 /** @type {BrowserWindow | null} */
@@ -139,9 +179,22 @@ function createMainWindow() {
     }
   });
 
-  const url = IS_DEV ? RENDERER_DEV_URL : RENDERER_PROD_URL;
-  mainWindow.loadURL(url);
-  if (IS_DEV) mainWindow.webContents.openDevTools({ mode: 'detach' });
+  // Dev: Vite serves the renderer on :5173 — load it directly.
+  // Prod: our backend serves the built renderer on :BACKEND_PORT — wait
+  // for /health, then load. Until then the window stays hidden so the
+  // user sees nothing rather than a connection-refused flash.
+  if (IS_DEV) {
+    mainWindow.loadURL(RENDERER_DEV_URL);
+    mainWindow.webContents.openDevTools({ mode: 'detach' });
+  } else {
+    const url = `http://127.0.0.1:${BACKEND_PORT}/`;
+    waitForBackend()
+      .then(() => mainWindow?.loadURL(url))
+      .catch(err => {
+        console.error('[main] backend never came up:', err.message);
+        mainWindow?.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(`<!doctype html><meta charset="utf-8"><body style="background:#0b0b0b;color:#eee;font:14px ui-sans-serif,system-ui;padding:40px"><h2>Town Inbox couldn't start its backend.</h2><p style="color:#fc8">${err.message}</p><p>Check the application logs and re-launch.</p></body>`)}`);
+      });
+  }
 }
 
 function buildMenu() {

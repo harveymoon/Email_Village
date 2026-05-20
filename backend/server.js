@@ -28,6 +28,9 @@ const PORT = process.env.PORT || 3091;
 app.use(cors({
   origin: (origin, callback) => {
     if (!origin) return callback(null, true);          // curl / same-origin
+    // Electron loads packaged renderer from file:// which sends the
+    // literal string "null" as Origin. Allow it explicitly.
+    if (origin === 'null') return callback(null, true);
     if (process.env.FRONTEND_URL && origin === process.env.FRONTEND_URL) return callback(null, true);
     if (/^https?:\/\/localhost(:\d+)?$/.test(origin)) return callback(null, true);
     if (/^https?:\/\/127\.0\.0\.1(:\d+)?$/.test(origin)) return callback(null, true);
@@ -58,6 +61,20 @@ app.use('/api', gmailRoutes);
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
+
+// Packaged-app self-serving: when TOWN_INBOX_RENDERER_DIR is set
+// (electron/main.cjs sets it to the unpacked dist/ resource dir), serve
+// the built renderer from the same origin as the API. Same-origin
+// means session cookies + CORS Just Work — no file://-Origin: null
+// gymnastics required.
+//
+// Dev (Vite on :5173) doesn't set this env; the / route below still
+// renders the friendly landing page in that case.
+const rendererDir = process.env.TOWN_INBOX_RENDERER_DIR;
+if (rendererDir) {
+  console.log(`📦 serving renderer from ${rendererDir}`);
+  app.use(express.static(rendererDir));
+}
 
 // Friendly landing message in case someone (or future-you) visits the
 // backend in a browser. The actual UI is the Phaser game on Vite's port.

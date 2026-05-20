@@ -5,11 +5,13 @@ appId: studio.spectra.towninbox
 productName: Town Inbox
 copyright: Copyright © 2026 Harvey Moon
 
-# Bundle the prebuilt renderer (dist/) AND the electron main/preload, and
-# stage the sibling backend/ folder as an "extra resource" so the packaged
-# app can spawn it with ELECTRON_RUN_AS_NODE.
+# Asar holds the Electron main/preload + package.json. dist/ and the
+# sibling backend/ live OUTSIDE asar in `extraResources` because:
+#   - Backend is spawned as a Node child process that needs real
+#     filesystem access for its node_modules + native modules.
+#   - The backend's Express static middleware needs to read the dist/
+#     files at runtime, which is awkward from inside an asar archive.
 files:
-  - dist/**
   - electron/**
   - package.json
 extraResources:
@@ -20,6 +22,10 @@ extraResources:
       - "!node_modules/.cache/**"
       - "!.gmail-tokens.json"   # never bake user tokens into the installer
       - "!.env"                 # never bake secrets into the installer
+  - from: dist
+    to: dist
+    filter:
+      - "**/*"
 
 directories:
   output: release
@@ -36,7 +42,12 @@ mac:
 
 win:
   target:
-    - target: nsis
+    # `dir` produces an unpacked folder under release/win-unpacked/ that
+    # contains TownInbox.exe — fully portable (zip it, copy it to a
+    # USB stick, double-click; no install). Also skips the
+    # winCodeSign / NSIS infrastructure that needs admin rights for
+    # symlink creation on Windows.
+    - target: dir
       arch: [x64]
 
 linux:

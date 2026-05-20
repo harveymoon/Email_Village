@@ -639,6 +639,18 @@ export const queryRepo = {
   inboxUnreadTotal() {
     return listStmts.inboxUnreadTotal.get()?.n ?? 0;
   },
+  /** Every UNREAD INBOX thread id from (email, account). Used by triage bulk-move. */
+  inboxThreadIdsForSender(email, account) {
+    return db.prepare(`
+      SELECT DISTINCT t.id
+        FROM threads t
+        JOIN thread_labels tl ON tl.thread_id = t.id
+       WHERE tl.raw_id = 'INBOX'
+         AND t.is_read = 0
+         AND t.account = ?
+         AND LOWER(t.from_email) = LOWER(?)
+    `).all(account, email).map(r => r.id);
+  },
 };
 
 // ---------- mutation_queue ----------

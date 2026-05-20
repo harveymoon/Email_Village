@@ -217,4 +217,16 @@ export const api = {
       }>;
       totalUnread: number;
     }>(`/api/inbox-senders?limit=${limit}`),
+  /** Bulk-move every unread INBOX thread for (email, account). Operates on the full SQLite store. */
+  inboxBulkMove: (email: string, account: string, addLabels: string[], removeLabels: string[] = ['INBOX']) =>
+    request<{ success: boolean; moved: number; threadIds: string[]; addRawIds: string[]; removeRawIds: string[] }>(
+      '/api/inbox-senders/bulk-move',
+      { method: 'POST', body: JSON.stringify({ email, account, addLabels, removeLabels }) },
+    ),
+  /** Bulk mark-read for every unread INBOX thread from (email, account). */
+  inboxBulkMarkRead: (email: string, account: string) =>
+    request<{ success: boolean; marked: number; threadIds: string[] }>(
+      '/api/inbox-senders/bulk-mark-read',
+      { method: 'POST', body: JSON.stringify({ email, account }) },
+    ),
 };

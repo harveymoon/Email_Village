@@ -93,6 +93,51 @@ router.get('/inbox-senders', (req, res) => {
   });
 });
 
+// Bulk-move every UNREAD INBOX thread from (email, account) through the
+// mutation queue. Operates directly on SQLite so it works on the full
+// inbox (not just whatever the renderer cache has loaded — that cache
+// only holds the latest ~1000 threads from /api/emails, so triage on a
+// sender with thousands of older unread messages was previously a no-op
+// for everything past the cache window).
+router.post('/inbox-senders/bulk-move', requireAuth, (req, res) => {
+  const { email, account, addLabels = [], removeLabels = ['INBOX'] } = req.body || {};
+  if (!email || !account) return res.status(400).json({ error: 'email and account required' });
+  if (!req.oauth2Clients[account]) return res.status(401).json({ error: `account not active: ${account}` });
+
+  const SYSTEM = new Set(['INBOX', 'SENT', 'DRAFT', 'SPAM', 'TRASH', 'UNREAD', 'STARRED', 'IMPORTANT']);
+  const accountLabels = labelsRepo.forAccount(account);
+  const resolve = (arr) => {
+    const out = [];
+    for (const label of arr) {
+      if (typeof label !== 'string') continue;
+      const { id: maybeId } = parseId(label);
+      if (SYSTEM.has(maybeId)) { out.push(maybeId); continue; }
+      const found = accountLabels.find(l => l.raw_id === maybeId || l.name === maybeId || l.name === label);
+      if (found) out.push(found.raw_id);
+    }
+    return out;
+  };
+  const addRawIds = resolve(addLabels);
+  const removeRawIds = resolve(removeLabels);
+  if (addRawIds.length === 0 && removeRawIds.length === 0) {
+    return res.status(400).json({ error: 'no resolvable labels in addLabels/removeLabels for this account', requestedAdd: addLabels, requestedRemove: removeLabels });
+  }
+
+  const ids = queryRepo.inboxThreadIdsForSender(email, account);
+  for (const tid of ids) applyAndEnqueueModify(tid, addRawIds, removeRawIds);
+  res.json({ success: true, moved: ids.length, threadIds: ids, addRawIds, removeRawIds });
+});
+
+// Bulk mark-read for every UNREAD INBOX thread from (email, account).
+router.post('/inbox-senders/bulk-mark-read', requireAuth, (req, res) => {
+  const { email, account } = req.body || {};
+  if (!email || !account) return res.status(400).json({ error: 'email and account required' });
+  if (!req.oauth2Clients[account]) return res.status(401).json({ error: `account not active: ${account}` });
+  const ids = queryRepo.inboxThreadIdsForSender(email, account);
+  for (const tid of ids) applyAndEnqueueMarkRead(tid, true);
+  res.json({ success: true, marked: ids.length, threadIds: ids });
+});
+
 // ---------------- gameplay state (was in localStorage) ----------------
 // Buildings, avatars, and people overrides used to live in
 // localStorage. They got wiped on every origin change (notably the

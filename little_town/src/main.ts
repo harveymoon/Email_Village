@@ -2298,36 +2298,66 @@ class VillageScene extends Phaser.Scene {
         return this.destinationsForMove(account, stub);
       },
       moveAllForSender: async (email, account, destLabelId, destBuildingName, overrideLabel) => {
-        // Find every INBOX thread from this sender in the local cache
-        // and run moveThread for each. The threadCache only sees
-        // labels the renderer has loaded — but we always load INBOX
-        // at spawn, so for inbox-scoped triage this is complete.
-        const inbox = this.threadCache.get('INBOX');
-        const matches = inbox.filter(t =>
-          t.account === account &&
-          t.from?.email?.toLowerCase() === email.toLowerCase(),
-        );
-        if (!matches.length) return 0;
-        setStatus(`Moving ${matches.length} threads to ${destBuildingName}…`, { tone: 'info', ttlMs: 6000 });
-        const results = await Promise.allSettled(
-          matches.map(t => this.moveThread(t.threadId, destLabelId, destBuildingName, overrideLabel)),
-        );
-        const ok = results.filter(r => r.status === 'fulfilled').length;
-        setStatus(`Moved ${ok}/${matches.length} to ${destBuildingName}`, { tone: 'ok' });
-        return ok;
+        // The renderer's threadCache only holds the latest ~1000 INBOX
+        // threads from /api/emails. A sender with 600 unread spread
+        // across years of history won't fit — so we delegate the bulk
+        // move to the backend, which operates directly on SQLite and
+        // covers the entire inbox in one transaction-per-thread.
+        // Resolve the destination label name client-side (same logic
+        // as moveThread) so the backend route only has to validate it.
+        let destBuilding: Building | undefined;
+        let candidateLabels: string[] = [];
+        if (destLabelId.startsWith('building:')) {
+          const id = Number(destLabelId.slice('building:'.length));
+          destBuilding = this.buildings.find(b => b.id === id);
+          candidateLabels = destBuilding ? getBuildingLabels(destBuilding).filter(n => n !== 'INBOX') : [];
+        } else {
+          destBuilding = this.buildings.find(b => getBuildingLabels(b).includes(destLabelId));
+          candidateLabels = [destLabelId];
+        }
+        if (!candidateLabels.length || !destBuilding) {
+          alert(`Can't move to ${destBuildingName}: building has no non-INBOX labels bound.`);
+          return 0;
+        }
+        const labelsInAccount = (this.labelCache || []).filter(l => l.account === account);
+        const namesInAccount = new Set(labelsInAccount.map(l => l.name));
+        const chosen = overrideLabel && namesInAccount.has(overrideLabel)
+          ? overrideLabel
+          : candidateLabels.find(n => namesInAccount.has(n));
+        if (!chosen) {
+          alert(`Can't move to ${destBuildingName}: none of its labels [${candidateLabels.join(', ')}] exist in ${account}.\n\nAdd a label that exists in this account to that building first.`);
+          return 0;
+        }
+        setStatus(`Bulk moving ${email}'s INBOX → ${destBuildingName}…`, { tone: 'info', ttlMs: 10000 });
+        const result = await api.inboxBulkMove(email, account, [chosen], ['INBOX']);
+        // Surgical cache update for threads that happened to be loaded.
+        // Threads outside the cache window get reflected on the next
+        // /api/emails fetch — meanwhile badges + people grid stay
+        // accurate because we refresh from authoritative backend counts.
+        for (const tid of result.threadIds) {
+          this.patchLocalThreadLabels(tid, chosen, ['INBOX']);
+          this.removeThreadFromLabelCache('INBOX', tid);
+          const t = this.findThreadInCache(tid);
+          if (t) this.addThreadToLabelCache(chosen, t);
+        }
+        this.refreshBuildingUnreadCounts().catch(err => console.warn('[triage] badge refresh failed', err));
+        // Respawn NPCs from the now-filtered cache: every NPC that was
+        // showing this sender at Post Office walks home.
+        this.respawnEmailNPCs().catch(err => console.warn('[triage] NPC respawn failed', err));
+        setStatus(`Moved ${result.moved} from ${email} to ${destBuildingName}`, { tone: 'ok' });
+        return result.moved;
       },
       markAllReadForSender: async (email, account) => {
-        const inbox = this.threadCache.get('INBOX');
-        const matches = inbox.filter(t =>
-          t.account === account &&
-          t.from?.email?.toLowerCase() === email.toLowerCase() &&
-          !t.isRead,
-        );
-        if (!matches.length) return 0;
-        setStatus(`Marking ${matches.length} read…`, { tone: 'info', ttlMs: 4000 });
-        for (const t of matches) this.markThreadRead(t);
-        setStatus(`Marked ${matches.length} read`, { tone: 'ok' });
-        return matches.length;
+        setStatus(`Bulk marking ${email}'s INBOX read…`, { tone: 'info', ttlMs: 8000 });
+        const result = await api.inboxBulkMarkRead(email, account);
+        for (const tid of result.threadIds) {
+          const t = this.findThreadInCache(tid);
+          if (t) t.isRead = true;
+        }
+        this.refreshBuildingUnreadCounts().catch(err => console.warn('[triage] badge refresh failed', err));
+        this.respawnEmailNPCs().catch(err => console.warn('[triage] NPC respawn failed', err));
+        setStatus(`Marked ${result.marked} read from ${email}`, { tone: 'ok' });
+        return result.marked;
       },
       openProfile: (email) => this.openProfileForEmail(email),
     });

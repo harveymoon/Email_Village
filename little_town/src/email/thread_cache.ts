@@ -158,4 +158,111 @@ export class ThreadCache {
     if (arr.some(t => t.threadId === thread.threadId)) return;
     arr.unshift(thread);
   }
+
+  /**
+   * Bulk version of patch + remove-from + add-to for a batch of thread
+   * ids that all moved the same way (same addName, same removeNames).
+   * Used by Inbox Triage to handle 100s-1000s of threads in one O(N)
+   * pass over each cache slot, instead of O(N) per thread (which made
+   * the renderer freeze and Electron blank the window).
+   *
+   *   - patches labels on every cached copy of any id in `threadIds`
+   *   - removes every id in `threadIds` from each removed label's slot
+   *   - prepends each matching thread to the added label's slot (if a
+   *     cache slot exists for it; we don't speculatively create one)
+   *   - fires ONE `thread:labels-updated` event with the full id list
+   *   - logs ONE summary line
+   */
+  bulkPatchAndMove(
+    threadIds: string[],
+    addName: string,
+    removeNames: string[],
+    account: string,
+  ): void {
+    if (!threadIds.length) return;
+    const idSet = new Set(threadIds);
+    const labels = this.deps.getLabelCache();
+    const addRaw = addName === 'INBOX'
+      ? 'INBOX'
+      : labels.find(l => l.account === account && l.name === addName)?.rawId;
+    const removeRawSet = new Set<string>(
+      removeNames.map(n => n === 'INBOX'
+        ? 'INBOX'
+        : labels.find(l => l.account === account && l.name === n)?.rawId)
+        .filter((v): v is string => !!v),
+    );
+
+    // ONE pass over every cached label slot: patch + collect movers.
+    const movers = new Map<string, EmailThread>();
+    let patchedCount = 0;
+    for (const [labelName, arr] of this.cache.entries()) {
+      // Remove ids from any slot that maps to a label being removed.
+      const slotIsRemoved = (labelName === 'INBOX' && removeRawSet.has('INBOX'))
+        || removeNames.includes(labelName);
+      if (slotIsRemoved) {
+        let w = 0;
+        for (let r = 0; r < arr.length; r++) {
+          const t = arr[r];
+          if (idSet.has(t.threadId)) {
+            // Patch + collect, but don't keep in this slot.
+            const before = t.labels.length;
+            t.labels = t.labels.filter(rid => !removeRawSet.has(rid));
+            if (addRaw && !t.labels.includes(addRaw)) t.labels.push(addRaw);
+            if (t.labels.length !== before) patchedCount++;
+            if (!movers.has(t.threadId)) movers.set(t.threadId, t);
+            continue;
+          }
+          arr[w++] = t;
+        }
+        arr.length = w;
+      } else {
+        // Slot isn't being removed — just patch matching threads in place.
+        for (const t of arr) {
+          if (!idSet.has(t.threadId)) continue;
+          const before = t.labels.length;
+          t.labels = t.labels.filter(rid => !removeRawSet.has(rid));
+          if (addRaw && !t.labels.includes(addRaw)) t.labels.push(addRaw);
+          if (t.labels.length !== before) patchedCount++;
+          if (!movers.has(t.threadId)) movers.set(t.threadId, t);
+        }
+      }
+    }
+
+    // Prepend movers to the destination cache slot (if it exists).
+    if (addRaw) {
+      const destArr = this.cache.get(addName);
+      if (destArr) {
+        const existing = new Set(destArr.map(t => t.threadId));
+        for (const t of movers.values()) {
+          if (!existing.has(t.threadId)) destArr.unshift(t);
+        }
+      }
+    }
+
+    console.log(`[move-bulk] patched ${patchedCount} cached thread copies across ${threadIds.length} ids → ${addName}`);
+    try {
+      document.dispatchEvent(new CustomEvent('thread:labels-updated', {
+        detail: { threadIds, addedRawId: addRaw || null, removedRawIds: [...removeRawSet], bulk: true },
+      }));
+    } catch { /* non-DOM env */ }
+  }
+
+  /** Bulk mark-as-read: flip isRead on every cached copy in one pass. */
+  bulkMarkRead(threadIds: string[]): number {
+    if (!threadIds.length) return 0;
+    const idSet = new Set(threadIds);
+    let n = 0;
+    for (const arr of this.cache.values()) {
+      for (const t of arr) {
+        if (!idSet.has(t.threadId)) continue;
+        if (!t.isRead) { t.isRead = true; n++; }
+      }
+    }
+    try {
+      document.dispatchEvent(new CustomEvent('thread:read-state-changed', {
+        detail: { threadIds, isRead: true, bulk: true },
+      }));
+    } catch { /* non-DOM env */ }
+    return n;
+  }
 }

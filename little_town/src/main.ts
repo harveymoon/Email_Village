@@ -2330,33 +2330,35 @@ class VillageScene extends Phaser.Scene {
         }
         setStatus(`Bulk moving ${email}'s INBOX → ${destBuildingName}…`, { tone: 'info', ttlMs: 10000 });
         const result = await api.inboxBulkMove(email, account, [chosen], ['INBOX']);
-        // Surgical cache update for threads that happened to be loaded.
-        // Threads outside the cache window get reflected on the next
-        // /api/emails fetch — meanwhile badges + people grid stay
-        // accurate because we refresh from authoritative backend counts.
-        for (const tid of result.threadIds) {
-          this.patchLocalThreadLabels(tid, chosen, ['INBOX']);
-          this.removeThreadFromLabelCache('INBOX', tid);
-          const t = this.findThreadInCache(tid);
-          if (t) this.addThreadToLabelCache(chosen, t);
-        }
-        this.refreshBuildingUnreadCounts().catch(err => console.warn('[triage] badge refresh failed', err));
-        // Respawn NPCs from the now-filtered cache: every NPC that was
-        // showing this sender at Post Office walks home.
-        this.respawnEmailNPCs().catch(err => console.warn('[triage] NPC respawn failed', err));
+        // ONE pass over every cached label slot to patch + filter every
+        // moved id at once. The naive per-id loop here was O(N×K): for
+        // 254 ids × ~10k cached threads = 10M operations + 254 events +
+        // 254 console.logs on the main thread, which froze the renderer
+        // long enough that Electron blanked the window. bulkPatchAndMove
+        // collapses it to ~O(N + K).
+        this.threadCache.bulkPatchAndMove(result.threadIds, chosen, ['INBOX'], account);
+        // Defer the heavy side-effects (per-building unread refresh hits
+        // /api/unread-count for every labeled building; respawnEmailNPCs
+        // destroys + rebuilds every NPC sprite) so the click feels
+        // instant. Two ticks because requestIdleCallback isn't available
+        // in Electron's renderer for plain HTML pages without a flag.
         setStatus(`Moved ${result.moved} from ${email} to ${destBuildingName}`, { tone: 'ok' });
+        setTimeout(() => {
+          this.refreshBuildingUnreadCounts().catch(err => console.warn('[triage] badge refresh failed', err));
+          this.respawnEmailNPCs().catch(err => console.warn('[triage] NPC respawn failed', err));
+        }, 50);
         return result.moved;
       },
       markAllReadForSender: async (email, account) => {
         setStatus(`Bulk marking ${email}'s INBOX read…`, { tone: 'info', ttlMs: 8000 });
         const result = await api.inboxBulkMarkRead(email, account);
-        for (const tid of result.threadIds) {
-          const t = this.findThreadInCache(tid);
-          if (t) t.isRead = true;
-        }
-        this.refreshBuildingUnreadCounts().catch(err => console.warn('[triage] badge refresh failed', err));
-        this.respawnEmailNPCs().catch(err => console.warn('[triage] NPC respawn failed', err));
+        // Single O(K) pass to flip isRead on every cached copy.
+        this.threadCache.bulkMarkRead(result.threadIds);
         setStatus(`Marked ${result.marked} read from ${email}`, { tone: 'ok' });
+        setTimeout(() => {
+          this.refreshBuildingUnreadCounts().catch(err => console.warn('[triage] badge refresh failed', err));
+          this.respawnEmailNPCs().catch(err => console.warn('[triage] NPC respawn failed', err));
+        }, 50);
         return result.marked;
       },
       openProfile: (email) => this.openProfileForEmail(email),

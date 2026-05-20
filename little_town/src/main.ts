@@ -18,6 +18,21 @@ import { hydratePeopleOverrides, resetPeopleOverridesForAccountChange } from './
 import { composeAndRegisterAvatar, AVATAR_FRAMES } from './avatar_texture';
 import { mountStatusBar, setStatus } from './status_bar';
 import { openDestinationPicker } from './ui/destination_picker';
+import {
+  computeMoveSuggestions as computeMoveSuggestionsPure,
+  rulesMatchingSender as rulesMatchingSenderPure,
+  findStaleRuleMatches as findStaleRuleMatchesPure,
+  type Suggestion as MoveSuggestion,
+  type Rule as ScenarioRule,
+} from './email/suggestion_engine';
+import {
+  loadBuildingBindings,
+  getBuildingLabelMap,
+  getBuildingNameMap,
+  persistBuilding as persistBuildingApi,
+  resetBuildingBindingsForAccountChange,
+} from './email/building_persistence';
+import { ThreadCache } from './email/thread_cache';
 
 // Mount the bottom status bar as soon as this module loads — Phaser
 // boot can take a beat and we want the bar visible before any
@@ -26,63 +41,18 @@ mountStatusBar();
 
 // Hydrate avatars + people overrides + buildings at module-load time
 // so the Phaser scene's synchronous getters return real data the first
-// time they're called. The scene's create() reads from
-// `prefetchedBuildingBindings` directly (no await needed — Phaser 4
-// doesn't reliably await async create()).
-let prefetchedBuildingBindings: Record<string, { customName: string | null; labels: string[] }> = {};
-
-// One-shot migration of legacy localStorage keys for building bindings.
-// Returns the merged map so the bootstrap below can POST entries to
-// the backend and seed prefetchedBuildingBindings on the same tick.
-function readLegacyBuildingsFromLocalStorage(): Record<string, { customName: string | null; labels: string[] }> {
-  const out: Record<string, { customName: string | null; labels: string[] }> = {};
-  try {
-    const rawV2 = localStorage.getItem('little_town.building_labels_v2');
-    const rawV1 = localStorage.getItem('little_town.building_labels');
-    const rawNames = localStorage.getItem('little_town.building_names');
-    if (!rawV2 && !rawV1 && !rawNames) return out;
-    const labels: Record<string, string[]> = rawV2
-      ? JSON.parse(rawV2)
-      : rawV1
-        ? Object.fromEntries(Object.entries(JSON.parse(rawV1) as Record<string, string>).filter(([, n]) => !!n).map(([id, n]) => [id, [n]]))
-        : {};
-    const names: Record<string, string> = rawNames ? JSON.parse(rawNames) : {};
-    for (const id of new Set([...Object.keys(labels), ...Object.keys(names)])) {
-      out[id] = { customName: names[id] || null, labels: labels[id] || [] };
-    }
-  } catch (err) {
-    console.warn('[bootstrap] reading legacy buildings from localStorage failed:', err);
-  }
-  return out;
-}
-
+// time they're called. Phaser.Game construction is gated on this
+// promise — see end of file. Buildings live in
+// email/building_persistence.ts; the scene reads via getBuildingNameMap()
+// / getBuildingLabelMap() after the bootstrap resolves.
 const bootstrapPersistedState: Promise<void> = (async () => {
   setStatus('Loading saved state…', { tone: 'info', ttlMs: 0 });
   try {
-    const [bindingsFromApi] = await Promise.all([
-      api.buildings.list().catch(err => { console.warn('[bootstrap] api.buildings.list failed:', err); return {}; }),
+    await Promise.all([
+      loadBuildingBindings(),
       hydrateAvatars(),
       hydratePeopleOverrides(),
     ]);
-    if (Object.keys(bindingsFromApi).length > 0) {
-      prefetchedBuildingBindings = bindingsFromApi;
-    } else {
-      // SQLite is empty — try migrating from localStorage. POSTs each
-      // legacy entry up to the backend and removes the legacy key.
-      const legacy = readLegacyBuildingsFromLocalStorage();
-      prefetchedBuildingBindings = legacy;
-      if (Object.keys(legacy).length > 0) {
-        await Promise.all(Object.entries(legacy).map(([id, b]) =>
-          api.buildings.put(id, b).catch(err =>
-            console.warn(`[bootstrap] migrate building ${id} failed:`, err))));
-        console.log(`[bootstrap] migrated ${Object.keys(legacy).length} building bindings from localStorage to SQLite`);
-        try {
-          localStorage.removeItem('little_town.building_labels_v2');
-          localStorage.removeItem('little_town.building_labels');
-          localStorage.removeItem('little_town.building_names');
-        } catch {}
-      }
-    }
   } catch (err) {
     console.warn('[bootstrap] hydrate failed:', err);
   } finally {
@@ -248,50 +218,22 @@ class VillageScene extends Phaser.Scene {
   // Tiled re-exports and page reloads.
   //
   // v2 stores an ARRAY of label names per building (multi-label support).
-  // Building bindings (custom names + label assignments) now live in
-  // SQLite via /api/buildings. Legacy localStorage keys kept ONLY for
-  // the one-shot migration in hydrateBuildingsFromApi() below; after
-  // that they're removed.
-  private static BUILDING_LABEL_STORAGE_KEY    = 'little_town.building_labels';     // v1 legacy
-  private static BUILDING_LABEL_STORAGE_KEY_V2 = 'little_town.building_labels_v2';  // v2 legacy
-  private static BUILDING_NAME_STORAGE_KEY     = 'little_town.building_names';      // legacy
+  // Building bindings (custom names + label assignments) live in
+  // SQLite via /api/buildings and are managed by
+  // email/building_persistence.ts. The scene just calls the synchronous
+  // getters below (already hydrated by bootstrapPersistedState before
+  // Phaser.Game is constructed) and calls persistBuilding(b) after
+  // any in-game edit.
 
-  // Two synchronous getters returning the hydrated maps. Both populated
-  // by hydrateBuildingsFromApi(), called once during scene create()
-  // before NPCs spawn. Empty {} until then.
-  private hydratedBindings: Record<string, { customName: string | null; labels: string[] }> = {};
-
-  private loadBuildingLabelMap(): Record<string, string[]> {
-    const out: Record<string, string[]> = {};
-    for (const [id, b] of Object.entries(this.hydratedBindings)) {
-      if (b.labels?.length) out[id] = b.labels;
-    }
-    return out;
-  }
-  private loadBuildingNameMap(): Record<string, string> {
-    const out: Record<string, string> = {};
-    for (const [id, b] of Object.entries(this.hydratedBindings)) {
-      if (b.customName) out[id] = b.customName;
-    }
-    return out;
-  }
+  private loadBuildingLabelMap = getBuildingLabelMap;
+  private loadBuildingNameMap = getBuildingNameMap;
 
   /** Persist one building's binding (name + labels) to /api/buildings. */
   private persistBuilding(b: Building): void {
-    this.hydratedBindings[String(b.id)] = {
-      customName: b.name || null,
-      labels: getBuildingLabels(b),
-    };
-    api.buildings.put(b.id, {
-      customName: b.name || null,
-      labels: getBuildingLabels(b),
-    }).catch(err => {
-      console.warn(`[buildings] save failed for ${b.id}:`, err);
-      try { (window as any).townStatus?.set?.(`Building save failed: ${err}`, { tone: 'err', ttlMs: 4000 }); } catch {}
-    });
+    persistBuildingApi(b.id, b.name || null, getBuildingLabels(b));
   }
 
-  // Compatibility shims — call sites still use the old method names.
+  // Compatibility shims — older call sites still use these names.
   private persistBuildingLabelMap(): void {
     for (const b of this.buildings) this.persistBuilding(b);
   }
@@ -314,32 +256,27 @@ class VillageScene extends Phaser.Scene {
   // flicker on every popup open. Future: invalidate after a move /
   // mark-read action (Phase 6) and tie into the R-key bulk refresh
   // (Phase 8).
-  private emailCache = new Map<string, EmailThread[]>();
-  private emailFetchPromises = new Map<string, Promise<EmailThread[]>>();
-
-  // Per-label fetch (one round-trip to /api/emails). Used as a building
-  // block by loadThreadsForBuilding below.
-  //
-  // After the local-first migration, the backend reads from SQLite and
-  // returns everything matching the query — there's no THREAD_LIMIT cap
-  // for the user to tune, no per-label localStorage cache to TTL, and
-  // no quota-backoff state to track. We pass a defensive cap of 1000
-  // (matches the backend default) just so a pathological query can't
-  // return a 100 MB JSON blob, but in practice every label fits.
+  // Thread cache + fetch dedup live in email/thread_cache.ts. Scene
+  // calls through `this.threadCache.loadForLabel(...)` etc. — kept as
+  // a `this.emailCache` getter for back-compat with existing call sites
+  // that access the underlying Map (`this.emailCache.entries()`,
+  // `.get()`, `.clear()`, `.values()` for sweeping).
+  private threadCache = new ThreadCache({ getLabelCache: () => this.labelCache || [] });
+  private get emailCache(): { entries(): IterableIterator<[string, EmailThread[]]>; values(): IterableIterator<EmailThread[]>; get(k: string): EmailThread[] | undefined; has(k: string): boolean; clear(): void; } {
+    return {
+      entries: () => this.threadCache.entries(),
+      values: () => {
+        const it = this.threadCache.entries();
+        return (function*() { for (const [, v] of it) yield v; })();
+      },
+      get: (k) => this.threadCache.has(k) ? this.threadCache.get(k) : undefined,
+      has: (k) => this.threadCache.has(k),
+      clear: () => this.threadCache.clear(),
+    };
+  }
 
   private async loadThreadsForLabel(labelName: string, force = false): Promise<EmailThread[]> {
-    if (!force && this.emailCache.has(labelName)) return this.emailCache.get(labelName)!;
-    if (!force && this.emailFetchPromises.has(labelName)) return this.emailFetchPromises.get(labelName)!;
-    const p = api.threads(`label:"${labelName}"`, 1000).then(resp => {
-      this.emailCache.set(labelName, resp.emails);
-      this.emailFetchPromises.delete(labelName);
-      return resp.emails;
-    }).catch(err => {
-      this.emailFetchPromises.delete(labelName);
-      throw err;
-    });
-    this.emailFetchPromises.set(labelName, p);
-    return p;
+    return this.threadCache.loadForLabel(labelName, force);
   }
 
   // Background: after the bound buildings have spawned their NPCs,
@@ -751,10 +688,9 @@ class VillageScene extends Phaser.Scene {
     // Phaser.Game construction is gated on bootstrapPersistedState, so
     // by the time we reach this point the building bindings + avatars
     // + people overrides have all been hydrated from SQLite (and any
-    // one-shot localStorage migration is already POSTed). Just copy
-    // the module-level prefetch into the scene field the synchronous
-    // getters read.
-    this.hydratedBindings = prefetchedBuildingBindings;
+    // one-shot localStorage migration is already POSTed). The synchronous
+    // getters in email/building_persistence.ts read from the hydrated
+    // cache.
     // Rehydrate per-building overrides. Order matters: names FIRST
     // (so Post_Office detection below uses the original Tiled name,
     // not a renamed one — otherwise renaming Post_Office would break
@@ -1153,8 +1089,12 @@ class VillageScene extends Phaser.Scene {
           console.log('[auth] account set changed, resetting module caches');
           resetAvatarsForAccountChange();
           resetPeopleOverridesForAccountChange();
+          resetBuildingBindingsForAccountChange();
           this.labelCache = null;
           this.labelCachePromise = null;
+          // Re-hydrate building bindings for the new account from
+          // /api/buildings (the in-memory cache was just cleared).
+          loadBuildingBindings().catch(err => console.warn('[buildings] re-hydrate after account change failed:', err));
         }
         this.emailCache.clear();
         this.respawnEmailNPCs()
@@ -2201,15 +2141,7 @@ class VillageScene extends Phaser.Scene {
   // user label simultaneously). Used by the People feature for sender
   // aggregation and per-person thread filtering.
   private getAllCachedThreads(): EmailThread[] {
-    const seen = new Set<string>();
-    const out: EmailThread[] = [];
-    for (const threads of this.emailCache.values()) {
-      for (const t of threads) {
-        if (seen.has(t.threadId)) continue;
-        seen.add(t.threadId); out.push(t);
-      }
-    }
-    return out;
+    return this.threadCache.getAll();
   }
 
   // U-key: aggregate every sender across cached threads and show the
@@ -2733,11 +2665,7 @@ class VillageScene extends Phaser.Scene {
   // Look up a thread by id across every cached label. Used by NPC
   // click — we usually have it from the spawn-time fetch.
   private findCachedThread(threadId: string): EmailThread | null {
-    for (const list of this.emailCache.values()) {
-      const t = list.find(x => x.threadId === threadId);
-      if (t) return t;
-    }
-    return null;
+    return this.threadCache.findById(threadId);
   }
 
   // Build the destination list for the "Move to…" picker. Pass
@@ -2777,40 +2705,9 @@ class VillageScene extends Phaser.Scene {
     return this.rulesCacheInFlight;
   }
 
-  // Walk cached rules and return any whose `from` criterion matches
-  // the given sender. Each match is mapped to the label name it would
-  // apply (first non-system add label). Returns label names only —
-  // caller wraps them as suggestions with the right confidence.
+  // Thin shim — implementation lives in email/suggestion_engine.ts.
   private rulesMatchingSender(senderEmail: string): Array<{ labelName: string; account: string }> {
-    const rules = this.rulesCache;
-    if (!rules) return [];
-    const labels = this.labelCache || [];
-    const senderLower = senderEmail.toLowerCase();
-    const SYSTEM = new Set(['INBOX', 'SENT', 'DRAFT', 'SPAM', 'TRASH', 'UNREAD', 'STARRED', 'IMPORTANT']);
-    const out: Array<{ labelName: string; account: string }> = [];
-    for (const r of rules) {
-      if (r.error) continue;
-      const from = (r.criteria?.from || '').toLowerCase().trim();
-      if (!from) continue;
-      const tokens = from.split(/[\s,]+|\bor\b/i).map((s: string) => s.trim()).filter(Boolean);
-      const senderMatches = tokens.some((tok: string) => {
-        if (tok === senderLower) return true;
-        if (tok.startsWith('@')) return senderLower.endsWith(tok);
-        if (!tok.includes('@') && tok.includes('.')) {
-          return senderLower.endsWith('@' + tok) || senderLower.endsWith('.' + tok);
-        }
-        return false;
-      });
-      if (!senderMatches) continue;
-      // Resolve the rule's add-label id → label name in the rule's account.
-      const adds: string[] = r.action?.addLabelIds || [];
-      for (const rawId of adds) {
-        if (SYSTEM.has(rawId)) continue;     // skip STARRED/IMPORTANT etc.
-        const found = labels.find(l => l.account === r.account && l.rawId === rawId);
-        if (found) out.push({ labelName: found.name, account: r.account });
-      }
-    }
-    return out;
+    return rulesMatchingSenderPure(senderEmail, this.rulesCache as ScenarioRule[] | null, this.labelCache || []);
   }
 
   // Scan every cached inbox thread for senders whose existing rules
@@ -2824,14 +2721,8 @@ class VillageScene extends Phaser.Scene {
   // to see deeper matches.
   async findStaleRuleMatches(): Promise<StaleRuleMatch[]> {
     if (!this.rulesCache) await this.loadRulesCache();
-    const rules = this.rulesCache || [];
-    const labels = this.labelCache || [];
-    const SYSTEM = new Set(['INBOX', 'SENT', 'DRAFT', 'SPAM', 'TRASH', 'UNREAD', 'STARRED', 'IMPORTANT']);
     const inbox = this.emailCache.get('INBOX') || [];
-    const out: StaleRuleMatch[] = [];
-    // Pre-build building-by-label map so we resolve the destination
-    // building once per (account, labelName) instead of per match.
-    const buildingForLabel = (labelName: string): string | null => {
+    const resolveBuildingName = (labelName: string): string | null => {
       for (const b of this.buildings) {
         const bound = getBuildingLabels(b);
         if (bound.includes(labelName)) return b.name;
@@ -2839,43 +2730,12 @@ class VillageScene extends Phaser.Scene {
       }
       return null;
     };
-    for (const t of inbox) {
-      const senderLower = (t.from?.email || '').toLowerCase();
-      if (!senderLower) continue;
-      for (const r of rules) {
-        if (r.error) continue;
-        if (r.account !== t.account) continue;
-        const from = (r.criteria?.from || '').toLowerCase().trim();
-        if (!from) continue;
-        const tokens = from.split(/[\s,]+|\bor\b/i).map((s: string) => s.trim()).filter(Boolean);
-        const senderMatches = tokens.some((tok: string) => {
-          if (tok === senderLower) return true;
-          if (tok.startsWith('@')) return senderLower.endsWith(tok);
-          if (!tok.includes('@') && tok.includes('.')) {
-            return senderLower.endsWith('@' + tok) || senderLower.endsWith('.' + tok);
-          }
-          return false;
-        });
-        if (!senderMatches) continue;
-        // First non-system add label is the rule's destination.
-        const adds: string[] = r.action?.addLabelIds || [];
-        const targetRawId = adds.find(id => !SYSTEM.has(id));
-        if (!targetRawId) continue;
-        // Already applied? Then it's not stale.
-        if (t.labels.includes(targetRawId)) continue;
-        const targetLabel = labels.find(l => l.account === r.account && l.rawId === targetRawId)?.name;
-        if (!targetLabel) continue;
-        out.push({
-          thread: t,
-          rule: r as any,
-          targetLabel,
-          buildingName: buildingForLabel(targetLabel),
-        });
-      }
-    }
-    // Newest threads first so the most urgent cleanup floats to the top.
-    out.sort((a, b) => new Date(b.thread.date).getTime() - new Date(a.thread.date).getTime());
-    return out;
+    return findStaleRuleMatchesPure(
+      inbox,
+      (this.rulesCache as ScenarioRule[]) || [],
+      this.labelCache || [],
+      resolveBuildingName,
+    ) as StaleRuleMatch[];
   }
 
   // Apply one stale-rule match: file the inbox thread under the rule's
@@ -2898,205 +2758,30 @@ class VillageScene extends Phaser.Scene {
     return this.moveThread(m.thread.threadId, destLabelId, destName, m.targetLabel);
   }
 
-  private computeMoveSuggestions(thread: EmailThread): Array<{ labelName: string; confidence: number; reason: string }> {
-    const senderEmail = thread.from?.email?.toLowerCase();
-    if (!senderEmail) return [];
-    const senderDomain = senderEmail.split('@')[1] || '';
-    const all = this.getAllCachedThreads();
-    const labelByIdKey = new Map<string, string>();
-    for (const l of (this.labelCache || [])) labelByIdKey.set(`${l.account}:${l.rawId}`, l.name);
-
-    // (1) + (2): count per-label co-filings for the same sender (and
-    // separately for the same domain).
-    const senderLabelCounts = new Map<string, number>();
-    const domainLabelCounts = new Map<string, number>();
-    for (const t of all) {
-      if (t.threadId === thread.threadId) continue;
-      const fromE = t.from?.email?.toLowerCase();
-      if (!fromE) continue;
-      const labelNames = t.labels
-        .map(rawId => labelByIdKey.get(`${t.account}:${rawId}`))
-        .filter((n): n is string => !!n && n !== 'INBOX');
-      if (fromE === senderEmail) {
-        for (const n of labelNames) senderLabelCounts.set(n, (senderLabelCounts.get(n) || 0) + 1);
-      } else if (senderDomain && fromE.endsWith(`@${senderDomain}`)) {
-        for (const n of labelNames) domainLabelCounts.set(n, (domainLabelCounts.get(n) || 0) + 1);
-      }
-    }
-
-    const out: Array<{ labelName: string; confidence: number; reason: string }> = [];
-    // (0) Existing Gmail filter match — top priority. If the user
-    // already created a rule that would label this email, suggest
-    // its destination first. Rules made AFTER an email arrived don't
-    // back-apply to that email; this surface lets the user finish
-    // the job with one click. Confidence 1.0 so rule matches always
-    // sort above any history-based signal.
-    if (this.rulesCache) {
-      const ruleMatches = this.rulesMatchingSender(senderEmail);
-      const seenLabels = new Set<string>();
-      for (const m of ruleMatches) {
-        if (seenLabels.has(m.labelName)) continue;
-        seenLabels.add(m.labelName);
-        out.push({
-          labelName: m.labelName,
-          confidence: 1.0,
-          // Spell out the destination label in the reason. When the
-          // rule targets a floor (e.g. Hobbies/Patreon) the popup row
-          // shows only the building label ("Hobbies") in its sub-line,
-          // so without this text the user has no signal that clicking
-          // will file to the specific floor.
-          reason: `Rule on ${m.account} → ${m.labelName}`,
-        });
-      }
-    } else {
-      // First time a suggestion is requested — kick off a background
-      // fetch so the NEXT picker (this session) gets rule matches.
-      this.loadRulesCache();
-    }
-    // Unsubscribe-link signal — if any message in this thread exposes
-    // the List-Unsubscribe header (or a body-link fallback), it's almost
-    // certainly a newsletter/promo. Boost every label bound to a
-    // Newsletters/* path or JUNK MAIL so the matching building floats
-    // toward the top. Confidence 0.92 sits below explicit rules (1.0)
-    // but above any sender-history signal. Stub threads from the NPC
-    // popup don't carry messages, so this only fires when we have the
-    // full thread cached — which is the common case.
-    const hasUnsubscribe = Array.isArray(thread.messages) && thread.messages.some(m => !!m?.unsubscribe);
-    if (hasUnsubscribe) {
-      const seenLabels = new Set(out.map(s => s.labelName));
-      for (const l of (this.labelCache || [])) {
-        if (seenLabels.has(l.name)) continue;
-        const lower = l.name.toLowerCase();
-        const isNewsletter = lower === 'newsletters' || lower.startsWith('newsletters/');
-        const isJunk = lower === 'junk mail' || lower === 'junk' || lower.startsWith('junk/');
-        if (!isNewsletter && !isJunk) continue;
-        out.push({
-          labelName: l.name,
-          confidence: 0.92,
-          reason: isJunk
-            ? 'Has unsubscribe link — likely junk'
-            : 'Has unsubscribe link — likely a newsletter',
-        });
-        seenLabels.add(l.name);
-      }
-    }
-    // Same-sender history dominates among non-rule signals.
-    for (const [labelName, count] of senderLabelCounts) {
-      if (count < 2) continue;
-      // Skip if a rule already covers this label — keep the higher-
-      // confidence rule suggestion and don't duplicate.
-      if (out.find(s => s.labelName === labelName)) continue;
-      out.push({
-        labelName,
-        confidence: Math.min(0.95, 0.7 + count * 0.04),
-        reason: `${count} email${count === 1 ? '' : 's'} from this sender already here`,
-      });
-    }
-    // Domain history fills gaps the sender history didn't cover.
-    for (const [labelName, count] of domainLabelCounts) {
-      if (count < 2) continue;
-      if (senderLabelCounts.has(labelName)) continue;
-      if (out.find(s => s.labelName === labelName)) continue;
-      out.push({
-        labelName,
-        confidence: Math.min(0.85, 0.55 + count * 0.03),
-        reason: `${count} email${count === 1 ? '' : 's'} from @${senderDomain} already here`,
-      });
-    }
-    // (3) Label-name vs sender-domain stem match. "tellart.com" → look
-    // for any label segment containing "tellart". Only fires when no
-    // co-filing signal covered the label already.
-    if (senderDomain) {
-      const stem = senderDomain.split('.')[0].toLowerCase();
-      if (stem.length >= 4) {
-        const seenLabels = new Set(out.map(s => s.labelName));
-        for (const l of (this.labelCache || [])) {
-          if (seenLabels.has(l.name)) continue;
-          const segments = l.name.toLowerCase().split('/');
-          if (segments.some(seg => seg === stem || seg.includes(stem))) {
-            out.push({ labelName: l.name, confidence: 0.6, reason: `Label name matches "${senderDomain}"` });
-            seenLabels.add(l.name);
-          }
-        }
-      }
-    }
-    out.sort((a, b) => b.confidence - a.confidence);
-    return out;
+  // Thin shim — implementation lives in email/suggestion_engine.ts.
+  private computeMoveSuggestions(thread: EmailThread): MoveSuggestion[] {
+    return computeMoveSuggestionsPure(thread, {
+      rules: this.rulesCache as ScenarioRule[] | null,
+      labels: this.labelCache || [],
+      allThreads: this.getAllCachedThreads(),
+      loadRulesCache: () => { this.loadRulesCache(); },
+    });
   }
 
-  // Walk every in-memory thread cache and patch the labels array on
-  // any thread whose threadId matches. Adds the new label's rawId
-  // (resolved from name + account via the label cache), removes any
-  // names in `removeNames` (also rawId-resolved). Same object refs as
-  // open popups hold, so their next render sees the new state.
+  // All four below delegate to email/thread_cache.ts. Kept as scene
+  // methods so the existing move/markRead orchestration callsites
+  // don't have to change.
   private patchLocalThreadLabels(threadId: string, addName: string, removeNames: string[]): void {
-    const labels = this.labelCache || [];
-    const account = threadId.split(':')[0];
-    const addRaw = addName === 'INBOX'
-      ? 'INBOX'
-      : labels.find(l => l.account === account && l.name === addName)?.rawId;
-    const removeRawSet = new Set<string>(
-      removeNames.map(n => n === 'INBOX'
-        ? 'INBOX'
-        : labels.find(l => l.account === account && l.name === n)?.rawId)
-        .filter((v): v is string => !!v),
-    );
-    let patched = 0;
-    const apply = (t: EmailThread) => {
-      if (t.threadId !== threadId) return;
-      const before = t.labels.length;
-      t.labels = t.labels.filter(rid => !removeRawSet.has(rid));
-      if (addRaw && !t.labels.includes(addRaw)) t.labels.push(addRaw);
-      if (t.labels.length !== before || t.labels.includes(addRaw || '')) patched++;
-    };
-    for (const arr of this.emailCache.values()) for (const t of arr) apply(t);
-    if (patched > 0) console.log(`[move] patched labels on ${patched} cached thread copies`);
-    // Notify any open UI that holds its own thread references (e.g. the
-    // person profile popup includes threads it fetched fresh from
-    // /api/threads/:id — those never lived in emailCache so the loop
-    // above doesn't reach them). Listeners patch their own copies and
-    // schedule a re-render.
-    try {
-      document.dispatchEvent(new CustomEvent('thread:labels-updated', {
-        detail: { threadId, addedRawId: addRaw || null, removedRawIds: [...removeRawSet] },
-      }));
-    } catch { }
+    this.threadCache.patchThreadLabels(threadId, addName, removeNames);
   }
-
-  // Find any in-memory copy of a thread by id. Returns the first hit
-  // from emailCache — multiple labels may hold the same thread; they
-  // should all share the same object reference by now (set during the
-  // original fetch), so any one is fine for read-only inspection.
   private findThreadInCache(threadId: string): EmailThread | null {
-    for (const arr of this.emailCache.values()) {
-      for (const t of arr) if (t.threadId === threadId) return t;
-    }
-    return null;
+    return this.threadCache.findById(threadId);
   }
-
-  // Drop a thread from one label's cached list (and persist the
-  // change). Used after a move so the source label's cache no longer
-  // claims a thread that has been re-filed elsewhere. Other threads
-  // in the cache are untouched — important so unrelated senders stay
-  // visible to the People grid.
   private removeThreadFromLabelCache(labelName: string, threadId: string): void {
-    const arr = this.emailCache.get(labelName);
-    if (!arr) return;
-    const idx = arr.findIndex(t => t.threadId === threadId);
-    if (idx < 0) return;
-    arr.splice(idx, 1);
-    // Persistent cache layer is gone — SQLite is the source of truth.
-    // In-memory emailCache is the only thing left to mutate.
+    this.threadCache.removeThreadFromLabel(labelName, threadId);
   }
-
-  // Insert a thread into a label's cached list if it isn't already
-  // there. Skipped when the label has no cache entry yet (next fetch
-  // will pick it up).
   private addThreadToLabelCache(labelName: string, thread: EmailThread): void {
-    const arr = this.emailCache.get(labelName);
-    if (!arr) return;
-    if (arr.some(t => t.threadId === thread.threadId)) return;
-    arr.unshift(thread);     // newest-first matches the API's default order
+    this.threadCache.addThreadToLabel(labelName, thread);
   }
 
   // For a single thread, list the building NAMES it is currently filed

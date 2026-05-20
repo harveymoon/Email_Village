@@ -497,6 +497,42 @@ const listStmts = {
      GROUP BY from_email
      ORDER BY unread DESC, total DESC
   `),
+  // INBOX-scoped sender ranking for the Inbox Triage view. Returns
+  // (email, name, account, unread, total, latest_date, latest_subject).
+  // Filters threads to those carrying the INBOX label only (other
+  // labels = already filed) and groups by lowercased sender +
+  // account so cross-account same-sender doesn't get merged into
+  // one row that can't be moved together.
+  inboxSendersRanked: db.prepare(`
+    SELECT t.from_email AS email,
+           MAX(t.from_name) AS name,
+           t.account,
+           COUNT(DISTINCT t.id) AS unread,
+           MAX(t.date) AS latest_date,
+           (SELECT t2.subject FROM threads t2
+              JOIN thread_labels tl2 ON tl2.thread_id = t2.id
+             WHERE t2.from_email = t.from_email
+               AND t2.account = t.account
+               AND tl2.raw_id = 'INBOX'
+             ORDER BY t2.date DESC LIMIT 1) AS latest_subject
+      FROM threads t
+      JOIN thread_labels tl ON tl.thread_id = t.id
+     WHERE t.from_email IS NOT NULL AND t.from_email <> ''
+       AND tl.raw_id = 'INBOX'
+       AND t.is_read = 0
+     GROUP BY t.from_email, t.account
+     ORDER BY unread DESC, latest_date DESC
+     LIMIT ?
+  `),
+  // Companion: total inbox unread across all accounts. Used by the
+  // triage progress meter.
+  inboxUnreadTotal: db.prepare(`
+    SELECT COUNT(DISTINCT t.id) AS n
+      FROM threads t
+      JOIN thread_labels tl ON tl.thread_id = t.id
+     WHERE tl.raw_id = 'INBOX'
+       AND t.is_read = 0
+  `),
 };
 
 // Helper: hydrate `labels_concat` into a real array, and attach a
@@ -596,6 +632,12 @@ export const queryRepo = {
   },
   peopleAggregate() {
     return listStmts.peopleAggregate.all();
+  },
+  inboxSendersRanked(limit = 100) {
+    return listStmts.inboxSendersRanked.all(limit);
+  },
+  inboxUnreadTotal() {
+    return listStmts.inboxUnreadTotal.get()?.n ?? 0;
   },
 };
 

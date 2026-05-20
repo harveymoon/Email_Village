@@ -204,4 +204,17 @@ export const api = {
               method: 'PUT', body: JSON.stringify(ov),
             }),
   },
+  /** Ranked top inbox senders by unread count for the Inbox Triage view. */
+  inboxSenders: (limit = 100) =>
+    request<{
+      senders: Array<{
+        email: string;
+        name: string | null;
+        account: string;
+        unread: number;
+        latest_date: number;
+        latest_subject: string | null;
+      }>;
+      totalUnread: number;
+    }>(`/api/inbox-senders?limit=${limit}`),
 };

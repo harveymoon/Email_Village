@@ -18,6 +18,7 @@ import { hydratePeopleOverrides, resetPeopleOverridesForAccountChange } from './
 import { composeAndRegisterAvatar, AVATAR_FRAMES } from './avatar_texture';
 import { mountStatusBar, setStatus } from './status_bar';
 import { openDestinationPicker } from './ui/destination_picker';
+import { openInboxTriage } from './ui/inbox_triage';
 import {
   computeMoveSuggestions as computeMoveSuggestionsPure,
   rulesMatchingSender as rulesMatchingSenderPure,
@@ -947,6 +948,7 @@ class VillageScene extends Phaser.Scene {
     });
     this.input.keyboard!.on('keydown-B', () => { if (!this.isTyping) this.openBuildingGrid(); });
     this.input.keyboard!.on('keydown-U', () => { if (!this.isTyping) this.openPeopleGridPopup(); });
+    this.input.keyboard!.on('keydown-I', () => { if (!this.isTyping) this.openInboxTriage(); });
     this.input.keyboard!.on('keydown-R', () => { if (!this.isTyping) this.refreshAllEmails(); });
     this.input.keyboard!.on('keydown-F', () => {
       if (this.isTyping) return;
@@ -2268,6 +2270,66 @@ class VillageScene extends Phaser.Scene {
         await Promise.allSettled(labelled.map(b => this.loadThreadsForBuilding(b, true)));
         this.openPeopleGridPopup();
       },
+    });
+  }
+
+  // Inbox Triage view — the backlog-cleanup workhorse. Modal lists
+  // every sender currently in INBOX, ranked by unread count, with
+  // per-row inline Move all / Mark all read / Open profile buttons.
+  // Backend serves the rank from a single SQL aggregate so the modal
+  // opens with the FULL inbox (not just whichever labels the cache
+  // happens to have loaded).
+  private openInboxTriage(): void {
+    if (!this.rulesCache) this.loadRulesCache().catch(() => { /* logged inside */ });
+    openInboxTriage({
+      destinationsForSender: (_email, account) => {
+        // Build the destination list as if this sender had one thread
+        // in INBOX: account-filtered + suggestion-annotated. We don't
+        // need the full thread object — destinationsForMove uses it
+        // only for the suggestion engine, which only reads
+        // from.email + threadId. A minimal stub works.
+        const stub = {
+          threadId: `${account}:triage-stub`,
+          account,
+          from: { email: _email, name: '', avatar: null },
+          labels: [],
+          messages: [],
+        } as unknown as EmailThread;
+        return this.destinationsForMove(account, stub);
+      },
+      moveAllForSender: async (email, account, destLabelId, destBuildingName, overrideLabel) => {
+        // Find every INBOX thread from this sender in the local cache
+        // and run moveThread for each. The threadCache only sees
+        // labels the renderer has loaded — but we always load INBOX
+        // at spawn, so for inbox-scoped triage this is complete.
+        const inbox = this.threadCache.get('INBOX');
+        const matches = inbox.filter(t =>
+          t.account === account &&
+          t.from?.email?.toLowerCase() === email.toLowerCase(),
+        );
+        if (!matches.length) return 0;
+        setStatus(`Moving ${matches.length} threads to ${destBuildingName}…`, { tone: 'info', ttlMs: 6000 });
+        const results = await Promise.allSettled(
+          matches.map(t => this.moveThread(t.threadId, destLabelId, destBuildingName, overrideLabel)),
+        );
+        const ok = results.filter(r => r.status === 'fulfilled').length;
+        setStatus(`Moved ${ok}/${matches.length} to ${destBuildingName}`, { tone: 'ok' });
+        return ok;
+      },
+      markAllReadForSender: async (email, account) => {
+        const inbox = this.threadCache.get('INBOX');
+        const matches = inbox.filter(t =>
+          t.account === account &&
+          t.from?.email?.toLowerCase() === email.toLowerCase() &&
+          !t.isRead,
+        );
+        if (!matches.length) return 0;
+        setStatus(`Marking ${matches.length} read…`, { tone: 'info', ttlMs: 4000 });
+        for (const t of matches) this.markThreadRead(t);
+        setStatus(`Marked ${matches.length} read`, { tone: 'ok' });
+        return matches.length;
+      },
+      openProfile: (email) => this.openProfileForEmail(email),
     });
   }
 
@@ -3749,7 +3811,8 @@ class VillageScene extends Phaser.Scene {
       ['T', '🗺',  'Map',       () => this.openMinimapFromBar()],
       ['B', '🏘',  'Buildings', () => this.openBuildingGrid()],
       ['U', '👥', 'People',    () => this.openPeopleGridPopup()],
-      ['F', '⚙', 'Rules',     () => openRulesPane({ accounts: this.currentAccounts, labels: this.labelCache, reauthUrl: (email) => api.reauthUrl(email) })],
+      ['I', '📬', 'Triage',    () => this.openInboxTriage()],
+      ['F', '⚙', 'Rules',     () => openRulesPane({ accounts: this.currentAccounts, labels: this.labelCache, reauthUrl: (email) => api.reauthUrl(email), findStaleMatches: () => this.findStaleRuleMatches(), applyRule: (m) => this.applyStaleRuleMatch(m) })],
       ['R', '↻', 'Refresh',   () => this.refreshAllEmails()],
       ['P', '··', 'Paths',     () => this.togglePaths()],
       ['G', '⊞', 'Grid',      () => this.toggleGridOverlay()],

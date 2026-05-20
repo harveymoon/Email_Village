@@ -78,6 +78,21 @@ router.get('/sync-status', (_req, res) => {
   res.json(statusRepo.snapshot());
 });
 
+// ---------------- inbox triage senders (ranked by unread) ----------------
+// Drives the Inbox Triage modal. Returns up to `limit` senders that
+// currently have unread mail in INBOX, ranked by unread count
+// descending. Each row includes the latest subject + account so the
+// modal can render with no follow-up requests. One COUNT(*) GROUP BY
+// + one sub-select per group — single round trip, sub-100ms even on
+// a 10k-thread inbox.
+router.get('/inbox-senders', (req, res) => {
+  const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 100));
+  res.json({
+    senders: queryRepo.inboxSendersRanked(limit),
+    totalUnread: queryRepo.inboxUnreadTotal(),
+  });
+});
+
 // ---------------- gameplay state (was in localStorage) ----------------
 // Buildings, avatars, and people overrides used to live in
 // localStorage. They got wiped on every origin change (notably the

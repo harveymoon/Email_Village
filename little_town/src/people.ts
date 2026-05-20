@@ -169,15 +169,33 @@ export function aggregatePeople(threads: EmailThread[]): Person[] {
   const overrides = loadOverrides();
   const map = new Map<string, Person>();
   for (const t of threads) {
-    for (const m of t.messages) {
+    // Walk per-message senders if we have them — that's the only way
+    // to capture multi-participant threads where the LATEST message
+    // is from someone other than the original sender. If messages are
+    // empty (cached threads can lose them when the backfill only had
+    // per-thread metadata — e.g. between Phase F.1's lazy body
+    // hydration), fall back to the thread-level from. The People grid
+    // would otherwise come up empty while NPCs were visibly walking
+    // around (NPCs use the thread-level from too).
+    const seenSenders = new Set<string>();
+    const senderSources: Array<{ email: string; name: string | undefined }> = [];
+    for (const m of t.messages || []) {
       const email = m.from?.email?.toLowerCase();
-      if (!email) continue;
+      if (!email || seenSenders.has(email)) continue;
+      seenSenders.add(email);
+      senderSources.push({ email, name: m.from?.name });
+    }
+    if (senderSources.length === 0) {
+      const email = t.from?.email?.toLowerCase();
+      if (email) senderSources.push({ email, name: t.from?.name });
+    }
+    for (const { email, name } of senderSources) {
       let p = map.get(email);
       if (!p) {
         const ov = overrides[email] || null;
         p = {
           email,
-          name: ov?.name || m.from?.name || email,
+          name: ov?.name || name || email,
           charKey: ov?.charKey || characterForKey(email).key,
           threadIds: new Set(),
           unread: 0,
@@ -198,8 +216,13 @@ export function aggregatePeople(threads: EmailThread[]): Person[] {
 }
 
 // Filter threads that include a given person as a sender. Used in
-// the individual popup to show their conversation history.
+// the individual popup to show their conversation history. Same
+// fallback as aggregatePeople — if message-level senders aren't on
+// the thread, fall back to thread-level `from`.
 export function threadsForPerson(threads: EmailThread[], email: string): EmailThread[] {
   const e = email.toLowerCase();
-  return threads.filter(t => t.messages.some(m => m.from?.email?.toLowerCase() === e));
+  return threads.filter(t => {
+    if (t.messages?.some(m => m.from?.email?.toLowerCase() === e)) return true;
+    return t.from?.email?.toLowerCase() === e;
+  });
 }

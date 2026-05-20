@@ -117,28 +117,38 @@ export async function backfillAccount(email, client) {
     let pagesDone = 0;
     let totalUpserted = 0;
     do {
-      await gmailLimiter.take(5);
       let listResp;
-      try {
-        listResp = await g.users.threads.list({
-          userId: 'me',
-          maxResults: PAGE_SIZE,
-          pageToken,
-        });
-      } catch (err) {
-        if (err.message?.includes('invalid_grant')) {
-          reportInvalidGrant(email);
-          return false;
-        }
-        console.warn(`[sync] ${email}: threads.list failed (page ${pagesDone}):`, err.message);
-        // Brief back-off + retry once; if it still fails, abort and let
-        // the next bootstrap pick up where we left off.
-        await new Promise(r => setTimeout(r, 5000));
+      // Per-page retry with exponential backoff matching the threads.get
+      // pattern below. Previously this gave up after a single 5s retry,
+      // so two quota errors in a row killed the entire backfill —
+      // leaving the user stuck at "77% loaded" with no auto-recovery
+      // until they manually relaunched the app. Backfill resumes
+      // cleanly on the next iteration even after long sleeps because
+      // pageToken is captured outside the try block, but we never got
+      // there before this fix.
+      let backoff = 0;
+      let listAttempts = 0;
+      while (true) {
+        await gmailLimiter.take(5);
         try {
           listResp = await g.users.threads.list({ userId: 'me', maxResults: PAGE_SIZE, pageToken });
-        } catch (err2) {
-          console.warn(`[sync] ${email}: threads.list retry also failed, bailing`, err2.message);
-          return false;
+          break;
+        } catch (err) {
+          if (err.message?.includes('invalid_grant')) {
+            reportInvalidGrant(email);
+            return false;
+          }
+          listAttempts++;
+          const isQuota = /quota|rate.?limit|429|userRateLimit|too many concurrent/i.test(err.message || '');
+          if (!isQuota && listAttempts >= 3) {
+            console.warn(`[sync] ${email}: threads.list non-quota error 3x, bailing — will resume on next tick. err:`, err.message);
+            return false;
+          }
+          backoff = backoff === 0 ? 5000 : Math.min(backoff * 2, 120_000);
+          if (listAttempts === 1 || listAttempts % 5 === 0) {
+            console.warn(`[sync] ${email}: threads.list page ${pagesDone} attempt ${listAttempts} failed (${isQuota ? 'quota' : 'transient'}), sleeping ${backoff / 1000}s`);
+          }
+          await new Promise(r => setTimeout(r, backoff));
         }
       }
       const allThreadIds = (listResp.data.threads || []).map(t => t.id);
@@ -255,6 +265,36 @@ export async function bootstrapSync() {
   // last few items if the user signs out mid-batch — once they sign
   // back in those will succeed).
   startMutationDrain();
+  // Auto-resume any account whose backfill bailed mid-walk (e.g. a
+  // sustained quota burst that exhausted threads.list retries).
+  // Without this the user has to restart the app to get past 77%.
+  startBackfillWatchdog();
+}
+
+// =========================================================================
+// Backfill watchdog — periodically re-kicks any account whose
+// last_full_sync_at is still null. backfillAccount is idempotent
+// (existsById skips already-stored threads, baked-in attemptInFlight
+// dedup via backfillsInFlight Map) so re-entering while one is still
+// running is a no-op.
+// =========================================================================
+
+const BACKFILL_WATCHDOG_MS = 5 * 60_000;   // every 5 min
+let watchdogHandle = null;
+
+function startBackfillWatchdog() {
+  if (watchdogHandle) return;
+  watchdogHandle = setInterval(() => {
+    const clients = getAllAuthenticatedClients();
+    for (const email of Object.keys(clients)) {
+      const acct = accountsRepo.get(email);
+      if (!acct || acct.last_full_sync_at) continue;     // done — skip
+      if (backfillsInFlight.has(email)) continue;        // already running — skip
+      console.log(`[sync-watchdog] re-kicking stalled backfill for ${email} (${acct.backfill_done || 0}/${acct.backfill_total || '?'})`);
+      backfillAccount(email, clients[email]).catch(err =>
+        console.warn(`[sync-watchdog] re-kick failed for ${email}:`, err.message));
+    }
+  }, BACKFILL_WATCHDOG_MS);
 }
 
 /**

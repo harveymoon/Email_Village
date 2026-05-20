@@ -1,0 +1,51 @@
+# electron-builder configuration for Town Inbox.
+# Run `npm run dist` (or :win/:mac/:linux) to produce installers.
+
+appId: studio.spectra.towninbox
+productName: Town Inbox
+copyright: Copyright © 2026 Harvey Moon
+
+# Bundle the prebuilt renderer (dist/) AND the electron main/preload, and
+# stage the sibling backend/ folder as an "extra resource" so the packaged
+# app can spawn it with ELECTRON_RUN_AS_NODE.
+files:
+  - dist/**
+  - electron/**
+  - package.json
+extraResources:
+  - from: ../backend
+    to: backend
+    filter:
+      - "**/*"
+      - "!node_modules/.cache/**"
+      - "!.gmail-tokens.json"   # never bake user tokens into the installer
+      - "!.env"                 # never bake secrets into the installer
+
+directories:
+  output: release
+
+asar: true
+
+mac:
+  category: public.app-category.productivity
+  target:
+    - target: dmg
+      arch: [arm64, x64]
+  hardenedRuntime: true
+  gatekeeperAssess: false
+
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+
+linux:
+  target:
+    - target: AppImage
+      arch: [x64]
+  category: Office
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true

@@ -6,8 +6,8 @@
 import { CHARACTERS } from './characters';
 import type { Person, PersonOverride, ContactField } from './people';
 import type { EmailThread } from './api';
-import { renderEmailListInto, destinationMatches, matchedFloor, applySuggestionStyle } from './email_ui';
-import { clampPopupToViewport } from './ui_helpers';
+import { renderEmailListInto } from './email_ui';
+import { openDestinationPicker } from './ui/destination_picker';
 import { avatarPortraitForEmail, loadAvatar, saveAvatar, type AvatarConfig } from './avatar';
 import { mountCharacterBuilder } from './character_builder_app.js';
 import { renderSenderRulesPanel } from './rules_ui';
@@ -575,88 +575,24 @@ export function closePersonPopup(): void {
 // across multiple buildings and you want to consolidate them all.
 function openPersonMoveAllPicker(anchor: HTMLElement, opts: OpenPersonPopupOptions): void {
   if (!opts.destinationsForPerson || !opts.onMoveAll) return;
-  document.querySelectorAll('[data-person-moveall]').forEach(el => el.remove());
   const destinations = opts.destinationsForPerson(opts.allThreads);
-  const rect = anchor.getBoundingClientRect();
-  const pop = document.createElement('div');
-  pop.setAttribute('data-person-moveall', '1');
-  pop.style.cssText = `
-    position:fixed; top:${rect.bottom + 6}px;
-    left:${Math.max(8, Math.min(rect.right - 360, window.innerWidth - 380))}px;
-    z-index:1300; width:360px; max-height:60vh; overflow:hidden;
-    background:#181818; color:#eee; border:1px solid #333; border-radius:8px;
-    box-shadow:0 16px 40px rgba(0,0,0,0.7); padding:8px;
-    display:flex; flex-direction:column; gap:6px;
-  `;
-  const header = document.createElement('div');
-  header.textContent = `Move ${opts.allThreads.length} thread${opts.allThreads.length === 1 ? '' : 's'} to…`;
-  header.style.cssText = 'color:#d8b8ff; font:600 12px ui-sans-serif,system-ui,sans-serif; padding:4px 6px;';
-  const search = document.createElement('input');
-  search.placeholder = 'Search buildings / labels…';
-  search.style.cssText = 'background:#0b0b0b; color:#eee; border:1px solid #333; border-radius:4px; padding:6px 10px; font:13px ui-sans-serif,system-ui,sans-serif;';
-  const list = document.createElement('div');
-  list.style.cssText = 'display:flex; flex-direction:column; gap:2px; overflow:auto;';
-  pop.appendChild(header); pop.appendChild(search); pop.appendChild(list);
-  pop.addEventListener('mousedown', (e) => e.stopPropagation());
-  document.body.appendChild(pop);
-  clampPopupToViewport(pop, { flipAboveAnchor: rect });
-
-  const render = () => {
-    list.innerHTML = '';
-    const q = search.value.trim().toLowerCase();
-    const filtered = destinations.filter(d => destinationMatches(d, q));
-    for (const d of filtered.slice(0, 200)) {
-      const r = document.createElement('div');
-      r.style.cssText = 'padding:8px 10px; cursor:pointer; border-radius:4px;';
-      const viaFloor = q ? matchedFloor(d, q) : null;
-      const sugg = applySuggestionStyle(r, d);
-      const suggFloor = (!viaFloor && sugg && sugg.label && sugg.label !== d.label) ? sugg.label : null;
-      const subText = viaFloor ? `via ${viaFloor}` : (suggFloor || d.label);
-      const subColor = viaFloor || suggFloor ? '#a8e6c0' : '#7a8b9f';
-      const suggLine = sugg
-        ? `<div style="color:#6ad26a; font:600 10px ui-monospace,Consolas,monospace;">✨ Suggested · ${escapeHtmlLocal(sugg.reason)}</div>`
-        : '';
-      r.innerHTML = `<div style="font:600 13px ui-sans-serif,system-ui,sans-serif; color:#fff;">${escapeHtmlLocal(d.buildingName)}</div>
-                     <div style="color:${subColor}; font:11px ui-monospace,Consolas,monospace;">${escapeHtmlLocal(subText)}</div>${suggLine}`;
-      r.addEventListener('mouseenter', () => r.style.background = sugg ? 'rgba(106, 210, 106, 0.15)' : '#22272e');
-      r.addEventListener('mouseleave', () => r.style.background = sugg ? 'rgba(106, 210, 106, 0.07)' : 'transparent');
-      r.addEventListener('click', async () => {
-        pop.remove();
-        try {
-          await opts.onMoveAll!(opts.allThreads, d.labelId, d.buildingName, viaFloor || sugg?.label || undefined);
-          // After the bulk move, the in-memory thread objects have
-          // been patched with their new labels — re-render the list
-          // so the building chips reflect the destination.
-          const refresh = (opts as any).__refreshConversations as (() => void) | undefined;
-          if (refresh) refresh();
-        }
-        catch (err) { alert(`Move all failed: ${err}`); }
-      });
-      list.appendChild(r);
-    }
-  };
-  search.addEventListener('input', render);
-  render();
-  setTimeout(() => {
-    search.focus();
-    const away = (e: MouseEvent) => {
-      if (pop.contains(e.target as Node)) return;
-      pop.remove();
-    };
-    document.addEventListener('mousedown', away, true);
-    // Override remove() so the document listener gets cleaned up
-    // regardless of how the popover is destroyed (outside-click,
-    // destination-pick, or external dismissal).
-    const origRemove = pop.remove.bind(pop);
-    pop.remove = () => {
-      document.removeEventListener('mousedown', away, true);
-      origRemove();
-    };
-  }, 0);
-}
-
-function escapeHtmlLocal(s: string): string {
-  return s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
+  openDestinationPicker({
+    anchor,
+    destinations,
+    header: `Move ${opts.allThreads.length} thread${opts.allThreads.length === 1 ? '' : 's'} to…`,
+    width: 360,
+    dataAttr: 'person-moveall',
+    onPick: async (d, overrideLabel) => {
+      try {
+        await opts.onMoveAll!(opts.allThreads, d.labelId, d.buildingName, overrideLabel);
+        // After the bulk move, the in-memory thread objects have been
+        // patched with their new labels — re-render the conversation
+        // list so the building chips reflect the destination.
+        const refresh = (opts as any).__refreshConversations as (() => void) | undefined;
+        if (refresh) refresh();
+      } catch (err) { alert(`Move all failed: ${err}`); }
+    },
+  });
 }
 
 // ---------- shared helpers ----------

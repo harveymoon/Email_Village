@@ -17,6 +17,7 @@ import { avatarPortraitForEmail, ensureAvatar, randomAvatar, saveAvatar, hydrate
 import { hydratePeopleOverrides, resetPeopleOverridesForAccountChange } from './people';
 import { composeAndRegisterAvatar, AVATAR_FRAMES } from './avatar_texture';
 import { mountStatusBar, setStatus } from './status_bar';
+import { openDestinationPicker } from './ui/destination_picker';
 
 // Mount the bottom status bar as soon as this module loads — Phaser
 // boot can take a beat and we want the bar visible before any
@@ -2646,21 +2647,16 @@ class VillageScene extends Phaser.Scene {
   // Companion picker for the "Move all" button — calls moveAllForNpc
   // with the selected destination instead of per-thread moveThread.
   private async openNpcMoveAllMenu(npc: NPC, anchor: HTMLElement): Promise<void> {
-    document.querySelectorAll('[data-npc-move]').forEach(el => el.remove());
     if (!this.rulesCache) {
       try { await this.loadRulesCache(); } catch { /* logged inside */ }
     }
-    const rect = anchor.getBoundingClientRect();
     // Move-all needs destinations whose labels cover EVERY account
     // represented by this NPC's threads (otherwise some threads would
-    // get orphaned). Derive unique accounts from the thread ids.
+    // get orphaned). All threads on one NPC are from the same sender,
+    // so any cached thread is a valid suggestion representative; fall
+    // back to a stub from NPC data if the cache evicted the real one.
     const tids: string[] = (npc.data as any)?.threadIds || [];
     const accounts = [...new Set(tids.map(id => id.split(':')[0]))];
-    // ALL threads on a single NPC come from the same sender (spawn
-    // groups by sender per building), so any cached thread is a valid
-    // representative for suggestion lookup. Fall back to constructing
-    // a stub from NPC data if the persistent cache evicted the real
-    // thread (suggestions only need from.email + threadId).
     let repThread: EmailThread | undefined;
     for (const tid of tids) {
       const t = this.findCachedThread(tid);
@@ -2679,92 +2675,30 @@ class VillageScene extends Phaser.Scene {
       }
     }
     const destinations = this.destinationsForMove(accounts, repThread);
-    const pop = document.createElement('div');
-    pop.setAttribute('data-npc-move', '1');
-    pop.style.cssText = `
-      position:fixed; top:${rect.bottom + 6}px;
-      left:${Math.max(8, Math.min(rect.right - 320, window.innerWidth - 340))}px;
-      z-index:1400; width:320px; max-height:60vh; overflow:hidden;
-      background:#181818; color:#eee; border:1px solid #333; border-radius:8px;
-      box-shadow:0 16px 40px rgba(0,0,0,0.75); padding:8px;
-      display:flex; flex-direction:column; gap:6px;
-    `;
-    const search = document.createElement('input');
-    search.placeholder = 'Search…';
-    search.style.cssText = 'background:#0b0b0b; color:#eee; border:1px solid #333; border-radius:4px; padding:6px 10px; font:13px ui-sans-serif,system-ui,sans-serif;';
-    const list = document.createElement('div');
-    list.style.cssText = 'display:flex; flex-direction:column; gap:2px; overflow:auto;';
-    pop.appendChild(search); pop.appendChild(list);
-    pop.addEventListener('mousedown', (e) => e.stopPropagation());
-    document.body.appendChild(pop);
-    clampPopupToViewport(pop, { flipAboveAnchor: rect });
-    const render = () => {
-      list.innerHTML = '';
-      const q = search.value.trim().toLowerCase();
-      const filtered = destinations.filter(d => destinationMatches(d, q));
-      for (const d of filtered.slice(0, 200)) {
-        const r = document.createElement('div');
-        r.style.cssText = 'padding:8px 10px; cursor:pointer; border-radius:4px;';
-        const viaFloor = q ? matchedFloor(d, q) : null;
-        const sugg = applySuggestionStyle(r, d);
-        // When a rule suggestion targets a sub-label (e.g. Hobbies/Patreon
-        // on a building bound to Hobbies), surface that path in the
-        // sub-line so the user can see which floor the click will file to.
-        const suggFloor = (!viaFloor && sugg && sugg.label && sugg.label !== d.label) ? sugg.label : null;
-        const subText = viaFloor ? `via ${viaFloor}` : (suggFloor || d.label);
-        const subColor = viaFloor ? '#a8e6c0' : (suggFloor ? '#a8e6c0' : '#7a8b9f');
-        const suggLine = sugg
-          ? `<div style="color:#6ad26a; font:600 10px ui-monospace,Consolas,monospace;">✨ Suggested · ${escapeHtml(sugg.reason)}</div>`
-          : '';
-        r.innerHTML = `<div style="font:600 13px ui-sans-serif,system-ui,sans-serif; color:#fff;">${escapeHtml(d.buildingName)}</div>
-                       <div style="color:${subColor}; font:11px ui-monospace,Consolas,monospace;">${escapeHtml(subText)}</div>${suggLine}`;
-        r.addEventListener('mouseenter', () => r.style.background = sugg ? 'rgba(106, 210, 106, 0.15)' : '#22272e');
-        r.addEventListener('mouseleave', () => r.style.background = sugg ? 'rgba(106, 210, 106, 0.07)' : 'transparent');
-        r.addEventListener('click', async () => {
-          pop.remove();
-          document.querySelectorAll('[data-npc-action]').forEach(el => el.remove());
-          // Override label priority: explicit floor-search match wins
-          // over the suggestion's matched label. Both end up calling
-          // moveThread/moveAllForNpc with overrideLabel so the right
-          // sub-label gets applied (rule → Hobbies/Patreon, not just
-          // the parent Hobbies).
-          try { await this.moveAllForNpc(npc, d.labelId, d.buildingName, viaFloor || sugg?.label || undefined); }
-          catch (err) { alert(`Move all failed: ${err}`); }
-        });
-        list.appendChild(r);
-      }
-    };
-    search.addEventListener('input', render);
-    render();
-    setTimeout(() => {
-      search.focus();
-      const away = (e: MouseEvent) => {
-        if (pop.contains(e.target as Node)) return;
-        pop.remove();
-      };
-      document.addEventListener('mousedown', away, true);
-      const origRemove = pop.remove.bind(pop);
-      pop.remove = () => { document.removeEventListener('mousedown', away, true); origRemove(); };
-    }, 0);
+    openDestinationPicker({
+      anchor,
+      destinations,
+      width: 320,
+      dataAttr: 'npc-move',
+      onPick: async (d, overrideLabel) => {
+        document.querySelectorAll('[data-npc-action]').forEach(el => el.remove());
+        try { await this.moveAllForNpc(npc, d.labelId, d.buildingName, overrideLabel); }
+        catch (err) { alert(`Move all failed: ${err}`); }
+      },
+    });
   }
 
   // Companion to openNpcActionMenu: pops a searchable destinations
   // picker right next to the "Move to…" button.
   private async openNpcMoveMenu(threadId: string, anchor: HTMLElement): Promise<void> {
-    document.querySelectorAll('[data-npc-move]').forEach(el => el.remove());
     // Ensure rules cache is hydrated BEFORE we compute suggestions so
     // the rule-match signal can promote its destination to the top.
-    // Cache hit on every call after bootstrap → no perceptible delay.
     if (!this.rulesCache) {
       try { await this.loadRulesCache(); } catch { /* logged inside */ }
     }
-    const rect = anchor.getBoundingClientRect();
-    // Per-thread filter: only show buildings whose labels exist in
-    // this thread's account.
     // Suggestions need a thread object to know the sender — fall back
-    // to constructing a minimal stub from the owning NPC's data when
-    // the persistent cache evicted the real thread. computeMoveSuggestions
-    // only reads from.email + threadId, so the stub is sufficient.
+    // to a stub from NPC data when the persistent cache evicted the
+    // real thread (computeMoveSuggestions only reads from.email).
     let forThread: EmailThread | undefined = this.findCachedThread(threadId) || undefined;
     if (!forThread) {
       const npc = this.npcs.find(n => {
@@ -2783,73 +2717,17 @@ class VillageScene extends Phaser.Scene {
       }
     }
     const destinations = this.destinationsForMove(threadId.split(':')[0], forThread);
-    const pop = document.createElement('div');
-    pop.setAttribute('data-npc-move', '1');
-    pop.style.cssText = `
-      position:fixed; top:${rect.bottom + 6}px;
-      left:${Math.max(8, Math.min(rect.right - 320, window.innerWidth - 340))}px;
-      z-index:1400; width:320px; max-height:60vh; overflow:hidden;
-      background:#181818; color:#eee; border:1px solid #333; border-radius:8px;
-      box-shadow:0 16px 40px rgba(0,0,0,0.75); padding:8px;
-      display:flex; flex-direction:column; gap:6px;
-    `;
-    const search = document.createElement('input');
-    search.placeholder = 'Search buildings / labels…';
-    search.style.cssText = 'background:#0b0b0b; color:#eee; border:1px solid #333; border-radius:4px; padding:6px 10px; font:13px ui-sans-serif,system-ui,sans-serif;';
-    const list = document.createElement('div');
-    list.style.cssText = 'display:flex; flex-direction:column; gap:2px; overflow:auto;';
-    pop.appendChild(search); pop.appendChild(list);
-    pop.addEventListener('mousedown', (e) => e.stopPropagation());
-    document.body.appendChild(pop);
-    clampPopupToViewport(pop, { flipAboveAnchor: rect });
-    const render = () => {
-      list.innerHTML = '';
-      const q = search.value.trim().toLowerCase();
-      const filtered = destinations.filter(d => destinationMatches(d, q));
-      for (const d of filtered.slice(0, 200)) {
-        const r = document.createElement('div');
-        r.style.cssText = 'padding:8px 10px; cursor:pointer; border-radius:4px;';
-        const viaFloor = q ? matchedFloor(d, q) : null;
-        const sugg = applySuggestionStyle(r, d);
-        // When a rule suggestion targets a sub-label (e.g. Hobbies/Patreon
-        // on a building bound to Hobbies), surface that path in the
-        // sub-line so the user can see which floor the click will file to.
-        const suggFloor = (!viaFloor && sugg && sugg.label && sugg.label !== d.label) ? sugg.label : null;
-        const subText = viaFloor ? `via ${viaFloor}` : (suggFloor || d.label);
-        const subColor = viaFloor ? '#a8e6c0' : (suggFloor ? '#a8e6c0' : '#7a8b9f');
-        const suggLine = sugg
-          ? `<div style="color:#6ad26a; font:600 10px ui-monospace,Consolas,monospace;">✨ Suggested · ${escapeHtml(sugg.reason)}</div>`
-          : '';
-        r.innerHTML = `<div style="font:600 13px ui-sans-serif,system-ui,sans-serif; color:#fff;">${escapeHtml(d.buildingName)}</div>
-                       <div style="color:${subColor}; font:11px ui-monospace,Consolas,monospace;">${escapeHtml(subText)}</div>${suggLine}`;
-        r.addEventListener('mouseenter', () => r.style.background = sugg ? 'rgba(106, 210, 106, 0.15)' : '#22272e');
-        r.addEventListener('mouseleave', () => r.style.background = sugg ? 'rgba(106, 210, 106, 0.07)' : 'transparent');
-        r.addEventListener('click', async () => {
-          pop.remove();
-          document.querySelectorAll('[data-npc-action]').forEach(el => el.remove());
-          // Override label priority: explicit floor-search match wins
-          // over the rule-suggestion's matched label. Either way the
-          // specific sub-label flows through to moveThread so the
-          // email files under the right floor (e.g. Hobbies/Patreon,
-          // not just Hobbies).
-          try { await this.moveThread(threadId, d.labelId, d.buildingName, viaFloor || sugg?.label || undefined); }
-          catch (err) { alert(`Move failed: ${err}`); }
-        });
-        list.appendChild(r);
-      }
-    };
-    search.addEventListener('input', render);
-    render();
-    setTimeout(() => {
-      search.focus();
-      const away = (e: MouseEvent) => {
-        if (pop.contains(e.target as Node)) return;
-        pop.remove();
-      };
-      document.addEventListener('mousedown', away, true);
-      const origRemove = pop.remove.bind(pop);
-      pop.remove = () => { document.removeEventListener('mousedown', away, true); origRemove(); };
-    }, 0);
+    openDestinationPicker({
+      anchor,
+      destinations,
+      width: 320,
+      dataAttr: 'npc-move',
+      onPick: async (d, overrideLabel) => {
+        document.querySelectorAll('[data-npc-action]').forEach(el => el.remove());
+        try { await this.moveThread(threadId, d.labelId, d.buildingName, overrideLabel); }
+        catch (err) { alert(`Move failed: ${err}`); }
+      },
+    });
   }
 
   // Look up a thread by id across every cached label. Used by NPC

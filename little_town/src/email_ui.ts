@@ -12,6 +12,8 @@
 import type { EmailThread, GmailLabel } from './api';
 import { avatarPortraitForEmail } from './avatar';
 import { clampPopupToViewport } from './ui_helpers';
+import { openDestinationPicker } from './ui/destination_picker';
+import { openPopover } from './ui/popover';
 
 export interface RenderEmailListOptions {
   threads: EmailThread[];
@@ -474,28 +476,22 @@ function openFloorMovePopover(
   onMoveToFloor: (t: EmailThread, opt: FloorOption) => Promise<void>,
   row: HTMLDivElement,
 ): void {
-  document.querySelectorAll('[data-floor-move]').forEach(el => el.remove());
-  const rect = anchor.getBoundingClientRect();
-  const pop = document.createElement('div');
-  pop.setAttribute('data-floor-move', '1');
-  pop.style.cssText = `
-    position:fixed; top:${rect.bottom + 6}px;
-    left:${Math.max(8, Math.min(rect.right - 320, window.innerWidth - 340))}px;
-    z-index:1300; width:320px; max-height:60vh; overflow:hidden;
-    background:#181818; color:#eee; border:1px solid #333; border-radius:8px;
-    box-shadow:0 16px 40px rgba(0,0,0,0.7); padding:8px;
-    display:flex; flex-direction:column; gap:6px;
-  `;
+  // FloorOption has a different shape than Destination (no buildingName /
+  // suggestion), so we use the raw openPopover + bespoke list rendering
+  // instead of openDestinationPicker. Same dismissal + listener safety.
+  const content = document.createElement('div');
+  content.style.cssText = 'display:flex; flex-direction:column; gap:6px;';
   const search = document.createElement('input');
   search.placeholder = 'Search floors…';
+  search.spellcheck = false;
   search.style.cssText = 'background:#0b0b0b; color:#eee; border:1px solid #333; border-radius:4px; padding:6px 10px; font:13px ui-sans-serif,system-ui,sans-serif;';
   const hint = document.createElement('div');
   hint.style.cssText = 'color:#666; font-size:11px; padding:2px 4px;';
   const list = document.createElement('div');
-  list.style.cssText = 'display:flex; flex-direction:column; gap:2px; overflow:auto;';
-  pop.appendChild(search); pop.appendChild(hint); pop.appendChild(list);
-  document.body.appendChild(pop);
-  clampPopupToViewport(pop, { flipAboveAnchor: rect });
+  list.style.cssText = 'display:flex; flex-direction:column; gap:2px; overflow-y:auto;';
+  content.appendChild(search); content.appendChild(hint); content.appendChild(list);
+
+  const handle = openPopover({ anchor, content, dataAttr: 'floor-move' });
 
   const render = () => {
     list.innerHTML = '';
@@ -507,24 +503,15 @@ function openFloorMovePopover(
     for (const f of filtered.slice(0, 300)) {
       const r = document.createElement('div');
       r.style.cssText = 'padding:6px 10px; cursor:pointer; border-radius:4px; display:flex; flex-direction:column; gap:2px;';
-      const top = document.createElement('div');
-      top.textContent = f.label;
-      top.style.cssText = 'font:600 13px ui-sans-serif,system-ui,sans-serif; color:#fff;';
-      const sub = document.createElement('div');
-      sub.textContent = f.fullName;
-      sub.style.cssText = 'color:#7a8b9f; font:11px ui-monospace,Consolas,monospace; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;';
-      r.appendChild(top); r.appendChild(sub);
+      r.innerHTML = `<div style="font:600 13px ui-sans-serif,system-ui,sans-serif; color:#fff;">${escapeAttr(f.label)}</div>
+                     <div style="color:#7a8b9f; font:11px ui-monospace,Consolas,monospace; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${escapeAttr(f.fullName)}</div>`;
       r.addEventListener('mouseenter', () => r.style.background = '#22272e');
       r.addEventListener('mouseleave', () => r.style.background = 'transparent');
-      r.addEventListener('mousedown', (e) => e.stopPropagation());
-      r.addEventListener('click', async (e) => {
-        e.stopPropagation();
-        pop.remove();
+      r.addEventListener('click', async () => {
+        handle.close();
+        row.style.opacity = '0.5'; row.style.pointerEvents = 'none';
         try {
-          row.style.opacity = '0.5'; row.style.pointerEvents = 'none';
           await onMoveToFloor(t, f);
-          // Caller is expected to re-render the list (floor grouping
-          // shifts); just drop our row optimistically.
           row.remove();
         } catch (err) {
           row.style.opacity = '1'; row.style.pointerEvents = 'auto';
@@ -536,24 +523,11 @@ function openFloorMovePopover(
   };
   search.addEventListener('input', render);
   render();
-  setTimeout(() => {
-    search.focus();
-    const away = (e: MouseEvent) => {
-      if (pop.contains(e.target as Node)) return;
-      pop.remove();
-    };
-    document.addEventListener('mousedown', away, true);
-    // Override remove() so any call path that destroys the popover
-    // (outside-click, destination-pick, external close) also detaches
-    // the document listener — without this, picking a destination
-    // called .remove() without removing `away`, leaving an orphaned
-    // listener on document for the rest of the session.
-    const origRemove = pop.remove.bind(pop);
-    pop.remove = () => {
-      document.removeEventListener('mousedown', away, true);
-      origRemove();
-    };
-  }, 0);
+  setTimeout(() => search.focus(), 0);
+}
+
+function escapeAttr(s: string): string {
+  return s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
 }
 
 // Small "→" button at the end of each row. Click opens a searchable
@@ -605,97 +579,23 @@ function openQuickMovePopover(
   onMove: (threadId: string, destLabelId: string, destBuildingName: string, overrideLabel?: string) => Promise<void>,
   row: HTMLDivElement,
 ): void {
-  document.querySelectorAll('[data-quick-move]').forEach(el => el.remove());
-  const rect = anchor.getBoundingClientRect();
-  const pop = document.createElement('div');
-  pop.setAttribute('data-quick-move', '1');
-  pop.style.cssText = `
-    position:fixed; top:${rect.bottom + 6}px;
-    left:${Math.max(8, Math.min(rect.right - 320, window.innerWidth - 340))}px;
-    z-index:1300; width:320px; max-height:60vh; overflow:hidden;
-    background:#181818; color:#eee; border:1px solid #333; border-radius:8px;
-    box-shadow:0 16px 40px rgba(0,0,0,0.7); padding:8px;
-    display:flex; flex-direction:column; gap:6px;
-  `;
-  const search = document.createElement('input');
-  search.placeholder = 'Search buildings / labels…';
-  search.style.cssText = 'background:#0b0b0b; color:#eee; border:1px solid #333; border-radius:4px; padding:6px 10px; font:13px ui-sans-serif,system-ui,sans-serif;';
-  const hint = document.createElement('div');
-  hint.style.cssText = 'color:#666; font-size:11px; padding:2px 4px;';
-  const list = document.createElement('div');
-  list.style.cssText = 'display:flex; flex-direction:column; gap:2px; overflow:auto;';
-  pop.appendChild(search); pop.appendChild(hint); pop.appendChild(list);
-  document.body.appendChild(pop);
-  clampPopupToViewport(pop, { flipAboveAnchor: rect });
-
-  const render = () => {
-    list.innerHTML = '';
-    const q = search.value.trim().toLowerCase();
-    const filtered = destinations.filter(d => destinationMatches(d, q));
-    hint.textContent = `${filtered.length} of ${destinations.length} destinations`;
-    for (const d of filtered.slice(0, 200)) {
-      const r = document.createElement('div');
-      r.style.cssText = 'padding:6px 10px; cursor:pointer; border-radius:4px; display:flex; flex-direction:column; gap:2px;';
-      const top = document.createElement('div');
-      top.textContent = d.buildingName;
-      top.style.cssText = 'font:600 13px ui-sans-serif,system-ui,sans-serif; color:#fff;';
-      const sub = document.createElement('div');
-      const viaFloor = q ? matchedFloor(d, q) : null;
-      const sugg = applySuggestionStyle(r, d);
-      // When the rule suggestion targets a sub-label, show that path
-      // here so the user sees which floor will receive the email.
-      const suggFloor = (!viaFloor && sugg && sugg.label && sugg.label !== d.label) ? sugg.label : null;
-      sub.textContent = viaFloor ? `via ${viaFloor}` : (suggFloor || d.label);
-      sub.style.cssText = `color:${viaFloor || suggFloor ? '#a8e6c0' : '#7a8b9f'}; font:11px ui-monospace,Consolas,monospace; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;`;
-      r.appendChild(top); r.appendChild(sub);
-      if (sugg) {
-        const tag = document.createElement('div');
-        tag.textContent = `✨ Suggested · ${sugg.reason}`;
-        tag.style.cssText = 'color:#6ad26a; font:600 10px ui-monospace,Consolas,monospace;';
-        r.appendChild(tag);
+  openDestinationPicker({
+    anchor,
+    destinations,
+    width: 320,
+    dataAttr: 'quick-move',
+    onPick: async (d, overrideLabel) => {
+      // Optimistic row fade: move is in flight; restore on failure.
+      row.style.opacity = '0.5'; row.style.pointerEvents = 'none';
+      try {
+        await onMove(t.threadId, d.labelId, d.buildingName, overrideLabel);
+        row.remove();
+      } catch (err) {
+        row.style.opacity = '1'; row.style.pointerEvents = 'auto';
+        alert(`Move failed: ${err}`);
       }
-      r.addEventListener('mouseenter', () => r.style.background = sugg ? 'rgba(106, 210, 106, 0.15)' : '#22272e');
-      r.addEventListener('mouseleave', () => r.style.background = sugg ? 'rgba(106, 210, 106, 0.07)' : 'transparent');
-      r.addEventListener('mousedown', (e) => e.stopPropagation());
-      r.addEventListener('click', async (e) => {
-        e.stopPropagation();
-        pop.remove();
-        try {
-          // Optimistically fade the row to indicate the move is in flight.
-          row.style.opacity = '0.5'; row.style.pointerEvents = 'none';
-          // Override label priority: floor-search match wins over
-          // rule-suggestion's matched label. Either applies the
-          // specific sub-label instead of the generic parent.
-          await onMove(t.threadId, d.labelId, d.buildingName, viaFloor || sugg?.label || undefined);
-          row.remove();
-        } catch (err) {
-          row.style.opacity = '1'; row.style.pointerEvents = 'auto';
-          alert(`Move failed: ${err}`);
-        }
-      });
-      list.appendChild(r);
-    }
-  };
-  search.addEventListener('input', render);
-  render();
-  setTimeout(() => {
-    search.focus();
-    const away = (e: MouseEvent) => {
-      if (pop.contains(e.target as Node)) return;
-      pop.remove();
-    };
-    document.addEventListener('mousedown', away, true);
-    // Override remove() so any call path that destroys the popover
-    // (outside-click, destination-pick, external close) also detaches
-    // the document listener — without this, picking a destination
-    // called .remove() without removing `away`, leaving an orphaned
-    // listener on document for the rest of the session.
-    const origRemove = pop.remove.bind(pop);
-    pop.remove = () => {
-      document.removeEventListener('mousedown', away, true);
-      origRemove();
-    };
-  }, 0);
+    },
+  });
 }
 
 // ---------- avatar stack ----------

@@ -13,8 +13,9 @@
 import DOMPurify from 'dompurify';
 import { api, type EmailThread, type EmailMessage } from './api';
 import { clampPopupToViewport } from './ui_helpers';
-import { destinationMatches, matchedFloor, applySuggestionStyle } from './email_ui';
 import { avatarPortraitForEmail } from './avatar';
+import { openDestinationPicker } from './ui/destination_picker';
+import { openPopover } from './ui/popover';
 
 export interface OpenEmailPopupOptions {
   // Either a threadId (we fetch from /api/threads/:id) or a pre-fetched
@@ -343,112 +344,31 @@ function buildReplyFooter(t: EmailThread): HTMLDivElement {
 
 // ---------- Move-to menu ----------
 function openMoveMenu(anchor: HTMLElement, t: EmailThread, opts: OpenEmailPopupOptions): void {
-  // If a menu is already open, treat this as a toggle/dismiss.
+  // Toggle: clicking the Move button while the menu is open dismisses it.
   const existing = document.querySelector('[data-move-menu]');
   if (existing) { existing.remove(); return; }
-  const rect = anchor.getBoundingClientRect();
-  const menu = document.createElement('div');
-  menu.setAttribute('data-move-menu', '1');
-  menu.style.cssText = `
-    position:fixed; top:${rect.bottom + 6}px; left:${Math.max(8, rect.right - 280)}px;
-    z-index:1200; min-width:260px; max-height:60vh; overflow:auto;
-    background:#181818; color:#eee; border:1px solid #333; border-radius:8px;
-    box-shadow:0 16px 40px rgba(0,0,0,0.7);
-    padding:6px;
-  `;
   if (!opts.destinations.length) {
-    const empty = document.createElement('div');
-    empty.textContent = 'No buildings have labels assigned.';
-    empty.style.cssText = 'padding:14px; color:#888; font-style:italic;';
-    menu.appendChild(empty);
-  } else {
-    // Search input — substring match across building name + label so a
-    // user with 50+ destinations can type to narrow.
-    const search = document.createElement('input');
-    search.placeholder = 'Search…';
-    search.spellcheck = false;
-    search.style.cssText = 'background:#0b0b0b; color:#eee; border:1px solid #333; border-radius:4px; padding:6px 10px; font:13px ui-sans-serif,system-ui,sans-serif; margin-bottom:4px;';
-    const list = document.createElement('div');
-    list.style.cssText = 'display:flex; flex-direction:column; gap:2px; overflow:auto; max-height:50vh;';
-    const render = () => {
-      list.innerHTML = '';
-      const q = search.value.trim().toLowerCase();
-      const filtered = opts.destinations.filter(d => destinationMatches(d, q));
-      for (const d of filtered) {
-        const item = document.createElement('div');
-        item.style.cssText = 'padding:10px 14px; cursor:pointer; border-radius:4px; display:flex; justify-content:space-between; align-items:center; gap:12px;';
-        const left = document.createElement('div');
-        const viaFloor = q ? matchedFloor(d, q) : null;
-        const sugg = applySuggestionStyle(item, d);
-        // Show the rule's specific floor in the sub-line when it
-        // differs from the building's bound label (rule says
-        // Hobbies/Patreon → row shows Hobbies/Patreon, not Hobbies).
-        const suggFloor = (!viaFloor && sugg && sugg.label && sugg.label !== d.label) ? sugg.label : null;
-        const subText = viaFloor ? `via ${viaFloor}` : (suggFloor || d.label);
-        const subColor = viaFloor || suggFloor ? '#a8e6c0' : '#7a8b9f';
-        const suggLine = sugg
-          ? `<div style="color:#6ad26a; font:600 10px ui-monospace,Consolas,monospace;">✨ Suggested · ${escapeHtml(sugg.reason)}</div>`
-          : '';
-        left.innerHTML = `<div style="font-weight:600;color:#fff;">${escapeHtml(d.buildingName)}</div>
-                          <div style="color:${subColor}; font:11px ui-monospace,Consolas,monospace;">${escapeHtml(subText)}</div>
-                          ${suggLine}`;
-        item.appendChild(left);
-        item.addEventListener('mouseenter', () => item.style.background = '#22272e');
-        item.addEventListener('mouseleave', () => item.style.background = 'transparent');
-        item.addEventListener('click', async () => {
-          menu.remove();
-          try {
-            // Override label priority: explicit floor-search match wins
-            // over the rule-suggestion's matched label. Either flows
-            // through onMove so the right sub-label is applied.
-            await opts.onMove(t.threadId, d.labelId, d.buildingName, viaFloor || sugg?.label || undefined);
-            closeEmailContentPopup();
-          } catch (err) {
-            alert(`Move failed: ${err}`);
-          }
-        });
-        list.appendChild(item);
-      }
-      if (!filtered.length) {
-        const none = document.createElement('div');
-        none.textContent = 'No destinations match.';
-        none.style.cssText = 'padding:10px 14px; color:#888; font-style:italic;';
-        list.appendChild(none);
-      }
-    };
-    search.addEventListener('input', render);
-    menu.appendChild(search);
-    menu.appendChild(list);
-    render();
-    setTimeout(() => search.focus(), 0);
+    // No destinations available — show a one-line message popover.
+    const msg = document.createElement('div');
+    msg.textContent = 'No buildings have labels assigned.';
+    msg.style.cssText = 'padding:14px; color:#888; font-style:italic;';
+    openPopover({ anchor, content: msg, width: 280, dataAttr: 'move-menu' });
+    return;
   }
-  document.body.appendChild(menu);
-  clampPopupToViewport(menu, { flipAboveAnchor: rect });
-  // Dismiss on outside-click. Capture phase: the email card's own
-  // mousedown listener stopPropagations bubbling to keep the modal from
-  // closing, which would otherwise prevent this handler from firing
-  // when the user clicks anywhere inside the modal body. Capture runs
-  // before bubble, so we see all clicks regardless.
-  //
-  // Cleanup is wired through a menu.remove() override so EVERY call
-  // path that destroys the popover — outside-click, destination-pick,
-  // external close — also removes the document listener. Without the
-  // override, picking a destination called .remove() without removing
-  // `away`, leaving an orphaned listener on document for the rest of
-  // the session.
-  setTimeout(() => {
-    const away = (e: MouseEvent) => {
-      if (menu.contains(e.target as Node)) return;
-      if (e.target === anchor) return;
-      menu.remove();
-    };
-    document.addEventListener('mousedown', away, true);
-    const origRemove = menu.remove.bind(menu);
-    menu.remove = () => {
-      document.removeEventListener('mousedown', away, true);
-      origRemove();
-    };
-  }, 0);
+  openDestinationPicker({
+    anchor,
+    destinations: opts.destinations,
+    width: 360,
+    dataAttr: 'move-menu',
+    onPick: async (d, overrideLabel) => {
+      try {
+        await opts.onMove(t.threadId, d.labelId, d.buildingName, overrideLabel);
+        closeEmailContentPopup();
+      } catch (err) {
+        alert(`Move failed: ${err}`);
+      }
+    },
+  });
 }
 
 // ---------- helpers ----------

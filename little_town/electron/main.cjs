@@ -136,6 +136,11 @@ function waitForBackend(timeoutMs = 30_000) {
 let mainWindow = null;
 
 function createMainWindow() {
+  // Icon path: in packaged builds electron-packager bakes the icon
+  // into the .exe metadata via --icon, but we also pass it to
+  // BrowserWindow so the window decoration + Alt-Tab thumbnail
+  // match in dev too.
+  const iconPath = path.join(__dirname, '..', 'build', 'icon.png');
   mainWindow = new BrowserWindow({
     width: 1480,
     height: 920,
@@ -143,6 +148,7 @@ function createMainWindow() {
     minHeight: 600,
     backgroundColor: '#0b0b0b',                // matches the renderer's dark theme so no white flash
     title: 'Town Inbox',
+    icon: iconPath,
     show: false,                               // wait for ready-to-show to avoid flicker
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),

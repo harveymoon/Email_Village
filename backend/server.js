@@ -13,10 +13,14 @@ import authRoutes from './routes/auth.js';
 import gmailRoutes from './routes/gmail.js';
 import { bootstrapSync } from './services/syncEngine.js';
 
-dotenv.config();
-
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// Load .env from THIS file's directory, not process.cwd(). The
+// packaged Electron app spawns this server with an unpredictable
+// cwd; cwd-relative .env loading was silently leaving the Google
+// OAuth client unconfigured.
+dotenv.config({ path: path.join(__dirname, '.env') });
 
 const app = express();
 // Default 3091 — picked to avoid the very-common :3000 (used by CRA,

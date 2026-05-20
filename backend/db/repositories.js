@@ -30,6 +30,11 @@ const accountsStmts = {
   remove: db.prepare(`DELETE FROM accounts WHERE email = ?`),
   setHistoryId: db.prepare(`UPDATE accounts SET history_id = ?, updated_at = ? WHERE email = ?`),
   incBackfillDone: db.prepare(`UPDATE accounts SET backfill_done = backfill_done + ?, updated_at = ? WHERE email = ?`),
+  markComplete: db.prepare(`
+    UPDATE accounts
+       SET history_id = ?, last_full_sync_at = ?, updated_at = ?
+     WHERE email = ?
+  `),
 };
 
 export const accountsRepo = {
@@ -59,14 +64,12 @@ export const accountsRepo = {
   },
   bumpBackfillDone: (email, delta) => accountsStmts.incBackfillDone.run(delta, now(), email),
   markBackfillComplete(email, historyId) {
-    accountsStmts.upsert.run({
-      email,
-      history_id: historyId,
-      last_full_sync_at: now(),
-      backfill_total: null,    // COALESCE so existing total stays if present
-      backfill_done: null,
-      ts: now(),
-    });
+    // Use a dedicated UPDATE rather than the upsert. The shared upsert
+    // statement has `INTEGER NOT NULL` on backfill_done; passing NULL
+    // through it sometimes trips SQLite's constraint check even though
+    // the UPDATE clause's COALESCE preserves the existing value.
+    // Direct UPDATE only touches the fields we actually want to change.
+    accountsStmts.markComplete.run(historyId, now(), now(), email);
   },
 };
 

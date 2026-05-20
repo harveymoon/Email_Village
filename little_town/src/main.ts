@@ -23,6 +23,72 @@ import { mountStatusBar, setStatus } from './status_bar';
 // fetching starts.
 mountStatusBar();
 
+// Hydrate avatars + people overrides + buildings at module-load time
+// so the Phaser scene's synchronous getters return real data the first
+// time they're called. The scene's create() reads from
+// `prefetchedBuildingBindings` directly (no await needed — Phaser 4
+// doesn't reliably await async create()).
+let prefetchedBuildingBindings: Record<string, { customName: string | null; labels: string[] }> = {};
+
+// One-shot migration of legacy localStorage keys for building bindings.
+// Returns the merged map so the bootstrap below can POST entries to
+// the backend and seed prefetchedBuildingBindings on the same tick.
+function readLegacyBuildingsFromLocalStorage(): Record<string, { customName: string | null; labels: string[] }> {
+  const out: Record<string, { customName: string | null; labels: string[] }> = {};
+  try {
+    const rawV2 = localStorage.getItem('little_town.building_labels_v2');
+    const rawV1 = localStorage.getItem('little_town.building_labels');
+    const rawNames = localStorage.getItem('little_town.building_names');
+    if (!rawV2 && !rawV1 && !rawNames) return out;
+    const labels: Record<string, string[]> = rawV2
+      ? JSON.parse(rawV2)
+      : rawV1
+        ? Object.fromEntries(Object.entries(JSON.parse(rawV1) as Record<string, string>).filter(([, n]) => !!n).map(([id, n]) => [id, [n]]))
+        : {};
+    const names: Record<string, string> = rawNames ? JSON.parse(rawNames) : {};
+    for (const id of new Set([...Object.keys(labels), ...Object.keys(names)])) {
+      out[id] = { customName: names[id] || null, labels: labels[id] || [] };
+    }
+  } catch (err) {
+    console.warn('[bootstrap] reading legacy buildings from localStorage failed:', err);
+  }
+  return out;
+}
+
+const bootstrapPersistedState: Promise<void> = (async () => {
+  setStatus('Loading saved state…', { tone: 'info', ttlMs: 0 });
+  try {
+    const [bindingsFromApi] = await Promise.all([
+      api.buildings.list().catch(err => { console.warn('[bootstrap] api.buildings.list failed:', err); return {}; }),
+      hydrateAvatars(),
+      hydratePeopleOverrides(),
+    ]);
+    if (Object.keys(bindingsFromApi).length > 0) {
+      prefetchedBuildingBindings = bindingsFromApi;
+    } else {
+      // SQLite is empty — try migrating from localStorage. POSTs each
+      // legacy entry up to the backend and removes the legacy key.
+      const legacy = readLegacyBuildingsFromLocalStorage();
+      prefetchedBuildingBindings = legacy;
+      if (Object.keys(legacy).length > 0) {
+        await Promise.all(Object.entries(legacy).map(([id, b]) =>
+          api.buildings.put(id, b).catch(err =>
+            console.warn(`[bootstrap] migrate building ${id} failed:`, err))));
+        console.log(`[bootstrap] migrated ${Object.keys(legacy).length} building bindings from localStorage to SQLite`);
+        try {
+          localStorage.removeItem('little_town.building_labels_v2');
+          localStorage.removeItem('little_town.building_labels');
+          localStorage.removeItem('little_town.building_names');
+        } catch {}
+      }
+    }
+  } catch (err) {
+    console.warn('[bootstrap] hydrate failed:', err);
+  } finally {
+    setStatus('', { ttlMs: 1 });
+  }
+})();
+
 let cursors: Phaser.Types.Input.Keyboard.CursorKeys;
 let player: Phaser.Types.Physics.Arcade.SpriteWithDynamicBody;
 let wasd: { W: Phaser.Input.Keyboard.Key; A: Phaser.Input.Keyboard.Key; S: Phaser.Input.Keyboard.Key; D: Phaser.Input.Keyboard.Key };
@@ -209,73 +275,6 @@ class VillageScene extends Phaser.Scene {
     return out;
   }
 
-  /**
-   * Fetch bindings from /api/buildings (one round-trip). If the API
-   * returns empty AND localStorage has legacy keys, POST every entry
-   * to the API to migrate, then clear the localStorage keys. Idempotent
-   * — re-runs are no-ops after the first successful migration.
-   */
-  private async hydrateBuildingsFromApi(): Promise<void> {
-    try {
-      const fromApi = await api.buildings.list();
-      this.hydratedBindings = fromApi;
-      const apiEmpty = Object.keys(fromApi).length === 0;
-      if (apiEmpty) await this.migrateBuildingsFromLocalStorage();
-    } catch (err) {
-      console.warn('[buildings] hydrate failed, falling back to localStorage:', err);
-      // Backend down — read legacy localStorage as best-effort fallback
-      // so the user isn't left with an empty map.
-      try {
-        const rawV2 = localStorage.getItem(VillageScene.BUILDING_LABEL_STORAGE_KEY_V2);
-        const rawV1 = localStorage.getItem(VillageScene.BUILDING_LABEL_STORAGE_KEY);
-        const rawNames = localStorage.getItem(VillageScene.BUILDING_NAME_STORAGE_KEY);
-        const labels: Record<string, string[]> = rawV2
-          ? JSON.parse(rawV2)
-          : rawV1
-            ? Object.fromEntries(Object.entries(JSON.parse(rawV1) as Record<string, string>).filter(([, n]) => !!n).map(([id, n]) => [id, [n]]))
-            : {};
-        const names: Record<string, string> = rawNames ? JSON.parse(rawNames) : {};
-        for (const id of new Set([...Object.keys(labels), ...Object.keys(names)])) {
-          this.hydratedBindings[id] = { customName: names[id] || null, labels: labels[id] || [] };
-        }
-      } catch { /* ignore */ }
-    }
-  }
-
-  /** One-shot migration of legacy keys → /api/buildings; clears keys on success. */
-  private async migrateBuildingsFromLocalStorage(): Promise<void> {
-    try {
-      const rawV2 = localStorage.getItem(VillageScene.BUILDING_LABEL_STORAGE_KEY_V2);
-      const rawV1 = localStorage.getItem(VillageScene.BUILDING_LABEL_STORAGE_KEY);
-      const rawNames = localStorage.getItem(VillageScene.BUILDING_NAME_STORAGE_KEY);
-      if (!rawV2 && !rawV1 && !rawNames) return;
-      const labels: Record<string, string[]> = rawV2
-        ? JSON.parse(rawV2)
-        : rawV1
-          ? Object.fromEntries(Object.entries(JSON.parse(rawV1) as Record<string, string>).filter(([, n]) => !!n).map(([id, n]) => [id, [n]]))
-          : {};
-      const names: Record<string, string> = rawNames ? JSON.parse(rawNames) : {};
-      const allIds = new Set([...Object.keys(labels), ...Object.keys(names)]);
-      const writes: Promise<unknown>[] = [];
-      for (const id of allIds) {
-        const customName = names[id] || null;
-        const ls = labels[id] || [];
-        this.hydratedBindings[id] = { customName, labels: ls };
-        writes.push(api.buildings.put(id, { customName, labels: ls }).catch(err =>
-          console.warn(`[buildings] migrate failed for ${id}:`, err)));
-      }
-      await Promise.all(writes);
-      console.log(`[buildings] migrated ${allIds.size} bindings from localStorage to SQLite`);
-      try {
-        localStorage.removeItem(VillageScene.BUILDING_LABEL_STORAGE_KEY_V2);
-        localStorage.removeItem(VillageScene.BUILDING_LABEL_STORAGE_KEY);
-        localStorage.removeItem(VillageScene.BUILDING_NAME_STORAGE_KEY);
-      } catch {}
-    } catch (err) {
-      console.warn('[buildings] localStorage migration skipped:', err);
-    }
-  }
-
   /** Persist one building's binding (name + labels) to /api/buildings. */
   private persistBuilding(b: Building): void {
     this.hydratedBindings[String(b.id)] = {
@@ -414,7 +413,7 @@ class VillageScene extends Phaser.Scene {
     this.load.atlas('atlas', 'assets/atlas/atlas.png', 'assets/atlas/atlas.json');
   }
 
-  async create(): Promise<void> {
+  create(): void {
     // Live avatar updates: when any caller (Settings → Customize my
     // avatar, profile popup → Customize…) saves an AvatarConfig, the
     // avatar module fires this event. We re-compose + swap the
@@ -740,14 +739,13 @@ class VillageScene extends Phaser.Scene {
       byRegion[k] = (byRegion[k] || 0) + 1;
     }
     console.log(`[buildings] ${this.buildings.length} total — per region:`, byRegion);
-    // Pull all migrated state from SQLite in parallel (one-shot
-    // localStorage migration happens inside each of these on first
-    // launch). Synchronous getters below read from the hydrated cache.
-    await Promise.all([
-      this.hydrateBuildingsFromApi(),
-      hydrateAvatars(),
-      hydratePeopleOverrides(),
-    ]);
+    // Phaser.Game construction is gated on bootstrapPersistedState, so
+    // by the time we reach this point the building bindings + avatars
+    // + people overrides have all been hydrated from SQLite (and any
+    // one-shot localStorage migration is already POSTed). Just copy
+    // the module-level prefetch into the scene field the synchronous
+    // getters read.
+    this.hydratedBindings = prefetchedBuildingBindings;
     // Rehydrate per-building overrides. Order matters: names FIRST
     // (so Post_Office detection below uses the original Tiled name,
     // not a renamed one — otherwise renaming Post_Office would break
@@ -4724,15 +4722,23 @@ class VillageScene extends Phaser.Scene {
   }
 }
 
-new Phaser.Game({
-  type: Phaser.AUTO,
-  parent: 'game-container',
-  pixelArt: true,
-  scale: {
-    mode: Phaser.Scale.RESIZE,
-    width: window.innerWidth,
-    height: window.innerHeight,
-  },
-  physics: { default: 'arcade', arcade: { gravity: { x: 0, y: 0 } } },
-  scene: [VillageScene],
+// Wait for the SQLite-backed persisted state to land before booting
+// the Phaser game. The bootstrap promise resolves quickly (sub-second
+// when the backend is responsive), and waiting here keeps create()
+// synchronous — Phaser 4 doesn't reliably await async create() and
+// can run update() against a half-initialised scene, which presented
+// as a black screen with no DevTools accessible.
+bootstrapPersistedState.then(() => {
+  new Phaser.Game({
+    type: Phaser.AUTO,
+    parent: 'game-container',
+    pixelArt: true,
+    scale: {
+      mode: Phaser.Scale.RESIZE,
+      width: window.innerWidth,
+      height: window.innerHeight,
+    },
+    physics: { default: 'arcade', arcade: { gravity: { x: 0, y: 0 } } },
+    scene: [VillageScene],
+  });
 });

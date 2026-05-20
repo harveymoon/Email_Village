@@ -124,17 +124,34 @@ export async function backfillAccount(email, client) {
       const threadIds = (listResp.data.threads || []).map(t => t.id);
       pageToken = listResp.data.nextPageToken;
 
-      // 3. Batch threads.get with format='metadata'.
+      // 3. Batch threads.get with format='metadata'. On rate-limit
+      //    failures (429 / "Quota exceeded"), pause progressively
+      //    longer (5s → 30s → 60s → 120s) and retry the batch before
+      //    giving up. Without this the per-minute quota dip just
+      //    spams the log and drops threads on the floor.
       for (let i = 0; i < threadIds.length; i += GET_BATCH) {
         const batch = threadIds.slice(i, i + GET_BATCH);
-        await gmailLimiter.take(batch.length * 5);
-        const results = await Promise.allSettled(batch.map(id =>
-          g.users.threads.get({
-            userId: 'me', id,
-            format: 'metadata',
-            metadataHeaders: ['From', 'To', 'Subject', 'Date', 'List-Unsubscribe', 'List-Unsubscribe-Post'],
-          })
-        ));
+        let results;
+        let backoff = 0;
+        for (let attempt = 0; attempt < 4; attempt++) {
+          await gmailLimiter.take(batch.length * 5);
+          results = await Promise.allSettled(batch.map(id =>
+            g.users.threads.get({
+              userId: 'me', id,
+              format: 'metadata',
+              metadataHeaders: ['From', 'To', 'Subject', 'Date', 'List-Unsubscribe', 'List-Unsubscribe-Post'],
+            })
+          ));
+          // If anything in this batch hit the quota, sleep + retry the
+          // full batch. allSettled returns each promise's own status,
+          // so we detect quota by scanning rejected reasons.
+          const quotaHit = results.some(r => r.status === 'rejected'
+            && /quota|rate.?limit|429|userRateLimit/i.test(r.reason?.message || ''));
+          if (!quotaHit) break;
+          backoff = backoff === 0 ? 5000 : Math.min(backoff * 2, 120_000);
+          console.warn(`[sync] ${email}: quota hit on batch (attempt ${attempt + 1}), sleeping ${backoff / 1000}s`);
+          await new Promise(r => setTimeout(r, backoff));
+        }
         for (const r of results) {
           if (r.status !== 'fulfilled') {
             console.warn(`[sync] ${email}: threads.get failed:`, r.reason?.message);

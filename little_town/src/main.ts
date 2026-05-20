@@ -13,7 +13,8 @@ import { aggregatePeople, threadsForPerson, saveOverride, characterForEmail } fr
 import { clampPopupToViewport } from './ui_helpers';
 import { openRulesPane, openRuleEditor, summarizeRuleCriteria, summarizeRuleAction, type StaleRuleMatch } from './rules_ui';
 import { openPeopleGrid, openPersonPopup, openAvatarCustomizer } from './people_ui';
-import { avatarPortraitForEmail, ensureAvatar, randomAvatar, saveAvatar } from './avatar';
+import { avatarPortraitForEmail, ensureAvatar, randomAvatar, saveAvatar, hydrateAvatars } from './avatar';
+import { hydratePeopleOverrides } from './people';
 import { composeAndRegisterAvatar, AVATAR_FRAMES } from './avatar_texture';
 import { mountStatusBar, setStatus } from './status_bar';
 
@@ -180,45 +181,122 @@ class VillageScene extends Phaser.Scene {
   // Tiled re-exports and page reloads.
   //
   // v2 stores an ARRAY of label names per building (multi-label support).
-  // v1 stored a single label-name string — we keep reading it for backwards
-  // compat and migrate on first save.
-  private static BUILDING_LABEL_STORAGE_KEY    = 'little_town.building_labels';     // v1: { [id]: string }
-  private static BUILDING_LABEL_STORAGE_KEY_V2 = 'little_town.building_labels_v2';  // v2: { [id]: string[] }
-  private static BUILDING_NAME_STORAGE_KEY     = 'little_town.building_names';
+  // Building bindings (custom names + label assignments) now live in
+  // SQLite via /api/buildings. Legacy localStorage keys kept ONLY for
+  // the one-shot migration in hydrateBuildingsFromApi() below; after
+  // that they're removed.
+  private static BUILDING_LABEL_STORAGE_KEY    = 'little_town.building_labels';     // v1 legacy
+  private static BUILDING_LABEL_STORAGE_KEY_V2 = 'little_town.building_labels_v2';  // v2 legacy
+  private static BUILDING_NAME_STORAGE_KEY     = 'little_town.building_names';      // legacy
 
-  // Returns a map of buildingId → label-name[]. Migrates legacy v1 entries.
+  // Two synchronous getters returning the hydrated maps. Both populated
+  // by hydrateBuildingsFromApi(), called once during scene create()
+  // before NPCs spawn. Empty {} until then.
+  private hydratedBindings: Record<string, { customName: string | null; labels: string[] }> = {};
+
   private loadBuildingLabelMap(): Record<string, string[]> {
-    try {
-      const rawV2 = localStorage.getItem(VillageScene.BUILDING_LABEL_STORAGE_KEY_V2);
-      if (rawV2) return JSON.parse(rawV2);
-      const rawV1 = localStorage.getItem(VillageScene.BUILDING_LABEL_STORAGE_KEY);
-      if (rawV1) {
-        const old: Record<string, string> = JSON.parse(rawV1);
-        const migrated: Record<string, string[]> = {};
-        for (const [id, name] of Object.entries(old)) if (name) migrated[id] = [name];
-        return migrated;
-      }
-    } catch { /* fall through */ }
-    return {};
-  }
-  private persistBuildingLabelMap(): void {
-    const map: Record<string, string[]> = {};
-    for (const b of this.buildings) {
-      const names = getBuildingLabels(b);
-      if (names.length) map[b.id] = names;
+    const out: Record<string, string[]> = {};
+    for (const [id, b] of Object.entries(this.hydratedBindings)) {
+      if (b.labels?.length) out[id] = b.labels;
     }
-    try { localStorage.setItem(VillageScene.BUILDING_LABEL_STORAGE_KEY_V2, JSON.stringify(map)); } catch {}
+    return out;
   }
   private loadBuildingNameMap(): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const [id, b] of Object.entries(this.hydratedBindings)) {
+      if (b.customName) out[id] = b.customName;
+    }
+    return out;
+  }
+
+  /**
+   * Fetch bindings from /api/buildings (one round-trip). If the API
+   * returns empty AND localStorage has legacy keys, POST every entry
+   * to the API to migrate, then clear the localStorage keys. Idempotent
+   * — re-runs are no-ops after the first successful migration.
+   */
+  private async hydrateBuildingsFromApi(): Promise<void> {
     try {
-      const raw = localStorage.getItem(VillageScene.BUILDING_NAME_STORAGE_KEY);
-      return raw ? JSON.parse(raw) : {};
-    } catch { return {}; }
+      const fromApi = await api.buildings.list();
+      this.hydratedBindings = fromApi;
+      const apiEmpty = Object.keys(fromApi).length === 0;
+      if (apiEmpty) await this.migrateBuildingsFromLocalStorage();
+    } catch (err) {
+      console.warn('[buildings] hydrate failed, falling back to localStorage:', err);
+      // Backend down — read legacy localStorage as best-effort fallback
+      // so the user isn't left with an empty map.
+      try {
+        const rawV2 = localStorage.getItem(VillageScene.BUILDING_LABEL_STORAGE_KEY_V2);
+        const rawV1 = localStorage.getItem(VillageScene.BUILDING_LABEL_STORAGE_KEY);
+        const rawNames = localStorage.getItem(VillageScene.BUILDING_NAME_STORAGE_KEY);
+        const labels: Record<string, string[]> = rawV2
+          ? JSON.parse(rawV2)
+          : rawV1
+            ? Object.fromEntries(Object.entries(JSON.parse(rawV1) as Record<string, string>).filter(([, n]) => !!n).map(([id, n]) => [id, [n]]))
+            : {};
+        const names: Record<string, string> = rawNames ? JSON.parse(rawNames) : {};
+        for (const id of new Set([...Object.keys(labels), ...Object.keys(names)])) {
+          this.hydratedBindings[id] = { customName: names[id] || null, labels: labels[id] || [] };
+        }
+      } catch { /* ignore */ }
+    }
+  }
+
+  /** One-shot migration of legacy keys → /api/buildings; clears keys on success. */
+  private async migrateBuildingsFromLocalStorage(): Promise<void> {
+    try {
+      const rawV2 = localStorage.getItem(VillageScene.BUILDING_LABEL_STORAGE_KEY_V2);
+      const rawV1 = localStorage.getItem(VillageScene.BUILDING_LABEL_STORAGE_KEY);
+      const rawNames = localStorage.getItem(VillageScene.BUILDING_NAME_STORAGE_KEY);
+      if (!rawV2 && !rawV1 && !rawNames) return;
+      const labels: Record<string, string[]> = rawV2
+        ? JSON.parse(rawV2)
+        : rawV1
+          ? Object.fromEntries(Object.entries(JSON.parse(rawV1) as Record<string, string>).filter(([, n]) => !!n).map(([id, n]) => [id, [n]]))
+          : {};
+      const names: Record<string, string> = rawNames ? JSON.parse(rawNames) : {};
+      const allIds = new Set([...Object.keys(labels), ...Object.keys(names)]);
+      const writes: Promise<unknown>[] = [];
+      for (const id of allIds) {
+        const customName = names[id] || null;
+        const ls = labels[id] || [];
+        this.hydratedBindings[id] = { customName, labels: ls };
+        writes.push(api.buildings.put(id, { customName, labels: ls }).catch(err =>
+          console.warn(`[buildings] migrate failed for ${id}:`, err)));
+      }
+      await Promise.all(writes);
+      console.log(`[buildings] migrated ${allIds.size} bindings from localStorage to SQLite`);
+      try {
+        localStorage.removeItem(VillageScene.BUILDING_LABEL_STORAGE_KEY_V2);
+        localStorage.removeItem(VillageScene.BUILDING_LABEL_STORAGE_KEY);
+        localStorage.removeItem(VillageScene.BUILDING_NAME_STORAGE_KEY);
+      } catch {}
+    } catch (err) {
+      console.warn('[buildings] localStorage migration skipped:', err);
+    }
+  }
+
+  /** Persist one building's binding (name + labels) to /api/buildings. */
+  private persistBuilding(b: Building): void {
+    this.hydratedBindings[String(b.id)] = {
+      customName: b.name || null,
+      labels: getBuildingLabels(b),
+    };
+    api.buildings.put(b.id, {
+      customName: b.name || null,
+      labels: getBuildingLabels(b),
+    }).catch(err => {
+      console.warn(`[buildings] save failed for ${b.id}:`, err);
+      try { (window as any).townStatus?.set?.(`Building save failed: ${err}`, { tone: 'err', ttlMs: 4000 }); } catch {}
+    });
+  }
+
+  // Compatibility shims — call sites still use the old method names.
+  private persistBuildingLabelMap(): void {
+    for (const b of this.buildings) this.persistBuilding(b);
   }
   private persistBuildingNameMap(): void {
-    const map: Record<string, string> = {};
-    for (const b of this.buildings) map[b.id] = b.name;
-    try { localStorage.setItem(VillageScene.BUILDING_NAME_STORAGE_KEY, JSON.stringify(map)); } catch {}
+    for (const b of this.buildings) this.persistBuilding(b);
   }
   private async ensureLabels(): Promise<import('./api').GmailLabel[]> {
     if (this.labelCache) return this.labelCache;
@@ -241,157 +319,27 @@ class VillageScene extends Phaser.Scene {
 
   // Per-label fetch (one round-trip to /api/emails). Used as a building
   // block by loadThreadsForBuilding below.
-  // Per-label fetch cap. Stored in localStorage so the user can raise
-  // it via Settings — default 250, which covers most inboxes without
-  // an explicit Gmail API quota issue. Gmail returns threads in
-  // reverse-chronological order, so the cap discards the OLDEST first
-  // (newest emails are prioritized as NPCs).
-  private static THREAD_LIMIT_DEFAULT = 250;
-  private static THREAD_LIMIT_STORAGE = 'little_town.thread_limit';
-  private getThreadLimit(): number {
-    try {
-      const raw = localStorage.getItem(VillageScene.THREAD_LIMIT_STORAGE);
-      if (raw) {
-        const v = parseInt(raw, 10);
-        if (Number.isFinite(v) && v > 0) return v;
-      }
-    } catch {/* fall through */}
-    return VillageScene.THREAD_LIMIT_DEFAULT;
-  }
-  private setThreadLimit(v: number): void {
-    try { localStorage.setItem(VillageScene.THREAD_LIMIT_STORAGE, String(v)); } catch {}
-  }
+  //
+  // After the local-first migration, the backend reads from SQLite and
+  // returns everything matching the query — there's no THREAD_LIMIT cap
+  // for the user to tune, no per-label localStorage cache to TTL, and
+  // no quota-backoff state to track. We pass a defensive cap of 1000
+  // (matches the backend default) just so a pathological query can't
+  // return a 100 MB JSON blob, but in practice every label fits.
 
-  // Persistent label-thread cache. Backed by localStorage with a TTL
-  // so dev-mode page reloads don't burn through Gmail's per-minute
-  // quota refetching the same data. Stripped to metadata + snippet
-  // (no full message bodies) to fit comfortably in localStorage.
-  // TTL is user-configurable via Settings (default 15 min).
-  private static CACHE_TTL_KEY = 'little_town.thread_cache_ttl_min';
-  private static CACHE_TTL_DEFAULT_MIN = 15;
-  private getCacheTtlMs(): number {
-    try {
-      const raw = localStorage.getItem(VillageScene.CACHE_TTL_KEY);
-      if (raw) {
-        const v = parseInt(raw, 10);
-        if (Number.isFinite(v) && v >= 0) return v * 60_000;
-      }
-    } catch {/* fall through */}
-    return VillageScene.CACHE_TTL_DEFAULT_MIN * 60_000;
-  }
-  private cacheKey(label: string): string { return `little_town.threads.${label}`; }
-  private loadFromPersistentCache(label: string): EmailThread[] | null {
-    try {
-      const raw = localStorage.getItem(this.cacheKey(label));
-      if (!raw) return null;
-      const { t, v } = JSON.parse(raw);
-      if (typeof t !== 'number' || !Array.isArray(v)) return null;
-      const ttl = this.getCacheTtlMs();
-      if (ttl > 0 && Date.now() - t > ttl) return null;
-      return v as EmailThread[];
-    } catch { return null; }
-  }
-  private saveToPersistentCache(label: string, threads: EmailThread[]): void {
-    // Strip heavy body fields — re-fetched on demand when the user
-    // actually opens a thread. Keeps the localStorage footprint sane.
-    const slim = threads.map(t => ({
-      ...t,
-      messages: t.messages?.map(m => ({ ...m, body: '', bodyHtml: '' })) || [],
-    }));
-    try {
-      localStorage.setItem(this.cacheKey(label), JSON.stringify({ t: Date.now(), v: slim }));
-    } catch (err) {
-      // localStorage quota exceeded — drop oldest entries and retry once.
-      this.evictOldestPersistentCache();
-      try { localStorage.setItem(this.cacheKey(label), JSON.stringify({ t: Date.now(), v: slim })); }
-      catch { console.warn('[cache] still over quota after eviction, skipping persist for', label); }
-    }
-  }
-  private evictOldestPersistentCache(): void {
-    const entries: Array<{ key: string; t: number }> = [];
-    for (let i = 0; i < localStorage.length; i++) {
-      const k = localStorage.key(i);
-      if (!k || !k.startsWith('little_town.threads.')) continue;
-      try {
-        const { t } = JSON.parse(localStorage.getItem(k) || '{}');
-        if (typeof t === 'number') entries.push({ key: k, t });
-      } catch {}
-    }
-    entries.sort((a, b) => a.t - b.t);
-    // Drop the oldest 25% to make room.
-    const dropN = Math.max(1, Math.floor(entries.length * 0.25));
-    for (let i = 0; i < dropN; i++) {
-      try { localStorage.removeItem(entries[i].key); } catch {}
-    }
-    console.log(`[cache] evicted ${dropN} oldest entries to free space`);
-  }
-  private invalidatePersistentCache(label: string): void {
-    try { localStorage.removeItem(this.cacheKey(label)); } catch {}
-  }
-  // Backoff state when Gmail returns a 429 / rateLimitExceeded /
-  // userRateLimitExceeded / quota error. We stop fetching for N
-  // seconds, then resume. Per-account would be nicer; per-session is
-  // good enough for now.
-  private apiBackoffUntilMs = 0;
-  private isInBackoff(): boolean {
-    return Date.now() < this.apiBackoffUntilMs;
-  }
-  private triggerBackoff(seconds: number): void {
-    this.apiBackoffUntilMs = Math.max(this.apiBackoffUntilMs, Date.now() + seconds * 1000);
-    console.warn(`[cache] backoff for ${seconds}s — Gmail quota exhausted`);
-  }
-
-  private async loadThreadsForLabel(labelName: string, force = false, limit?: number): Promise<EmailThread[]> {
+  private async loadThreadsForLabel(labelName: string, force = false): Promise<EmailThread[]> {
     if (!force && this.emailCache.has(labelName)) return this.emailCache.get(labelName)!;
     if (!force && this.emailFetchPromises.has(labelName)) return this.emailFetchPromises.get(labelName)!;
-    // Try persistent cache before going to the network — this is the
-    // single biggest reason quota stays low during dev iteration.
-    if (!force) {
-      const cached = this.loadFromPersistentCache(labelName);
-      if (cached) {
-        this.emailCache.set(labelName, cached);
-        return cached;
-      }
-    }
-    // If Gmail recently rate-limited us, fall through to whatever
-    // memory cache has (probably nothing) rather than queue more 429s.
-    if (this.isInBackoff()) {
-      return this.emailCache.get(labelName) || [];
-    }
-    const queryLabel = labelName;
-    const cap = limit ?? this.getThreadLimit();
-    const p = api.threads(`label:"${queryLabel}"`, cap).then(resp => {
+    const p = api.threads(`label:"${labelName}"`, 1000).then(resp => {
       this.emailCache.set(labelName, resp.emails);
-      this.saveToPersistentCache(labelName, resp.emails);
       this.emailFetchPromises.delete(labelName);
       return resp.emails;
     }).catch(err => {
       this.emailFetchPromises.delete(labelName);
-      // Detect Gmail quota errors and back off so we stop hammering.
-      const msg = String(err?.message || err);
-      if (/quota|rate.?limit|429|userRateLimit/i.test(msg)) {
-        this.triggerBackoff(60);
-      }
       throw err;
     });
     this.emailFetchPromises.set(labelName, p);
     return p;
-  }
-
-  // Clear every persistent label cache entry. Wired to the Settings
-  // popup's "Clear cache" button — handy when iterating during dev or
-  // when stale data is causing weird UI.
-  clearPersistentCache(): number {
-    const keys: string[] = [];
-    for (let i = 0; i < localStorage.length; i++) {
-      const k = localStorage.key(i);
-      if (k && k.startsWith('little_town.threads.')) keys.push(k);
-    }
-    for (const k of keys) {
-      try { localStorage.removeItem(k); } catch {}
-    }
-    this.emailCache.clear();
-    return keys.length;
   }
 
   // Background: after the bound buildings have spawned their NPCs,
@@ -466,7 +414,7 @@ class VillageScene extends Phaser.Scene {
     this.load.atlas('atlas', 'assets/atlas/atlas.png', 'assets/atlas/atlas.json');
   }
 
-  create(): void {
+  async create(): Promise<void> {
     // Live avatar updates: when any caller (Settings → Customize my
     // avatar, profile popup → Customize…) saves an AvatarConfig, the
     // avatar module fires this event. We re-compose + swap the
@@ -792,10 +740,18 @@ class VillageScene extends Phaser.Scene {
       byRegion[k] = (byRegion[k] || 0) + 1;
     }
     console.log(`[buildings] ${this.buildings.length} total — per region:`, byRegion);
-    // Rehydrate per-building overrides from localStorage. Order matters:
-    // names FIRST (so Post_Office detection below uses the original
-    // Tiled name, not a renamed one — otherwise renaming Post_Office
-    // would break the INBOX binding).
+    // Pull all migrated state from SQLite in parallel (one-shot
+    // localStorage migration happens inside each of these on first
+    // launch). Synchronous getters below read from the hydrated cache.
+    await Promise.all([
+      this.hydrateBuildingsFromApi(),
+      hydrateAvatars(),
+      hydratePeopleOverrides(),
+    ]);
+    // Rehydrate per-building overrides. Order matters: names FIRST
+    // (so Post_Office detection below uses the original Tiled name,
+    // not a renamed one — otherwise renaming Post_Office would break
+    // the INBOX binding).
     const savedNames = this.loadBuildingNameMap();
     for (const b of this.buildings) {
       if (savedNames[b.id]) {
@@ -3182,18 +3138,18 @@ class VillageScene extends Phaser.Scene {
     const idx = arr.findIndex(t => t.threadId === threadId);
     if (idx < 0) return;
     arr.splice(idx, 1);
-    this.saveToPersistentCache(labelName, arr);
+    // Persistent cache layer is gone — SQLite is the source of truth.
+    // In-memory emailCache is the only thing left to mutate.
   }
 
   // Insert a thread into a label's cached list if it isn't already
   // there. Skipped when the label has no cache entry yet (next fetch
-  // will pick it up). Persists the updated list.
+  // will pick it up).
   private addThreadToLabelCache(labelName: string, thread: EmailThread): void {
     const arr = this.emailCache.get(labelName);
     if (!arr) return;
     if (arr.some(t => t.threadId === thread.threadId)) return;
     arr.unshift(thread);     // newest-first matches the API's default order
-    this.saveToPersistentCache(labelName, arr);
   }
 
   // For a single thread, list the building NAMES it is currently filed
@@ -4279,104 +4235,10 @@ class VillageScene extends Phaser.Scene {
     accList.appendChild(addBtn);
     body.appendChild(accList);
 
-    // ---- NPC display limit ----
-    // Per-label fetch cap. Default 250 keeps Gmail API requests fast;
-    // raise it if you have a label with way more unread than that and
-    // want every email represented as an NPC. Changing the value
-    // saves immediately; "Apply" forces a respawn against the new cap.
-    body.appendChild(this.sectionLabel('NPCs'));
-    const npcRow = document.createElement('div');
-    npcRow.style.cssText = 'display:flex; gap:10px; align-items:center; flex-wrap:wrap;';
-    const npcLabel = document.createElement('label');
-    npcLabel.style.cssText = 'color:#ccc; font:13px ui-sans-serif,system-ui,sans-serif;';
-    npcLabel.textContent = 'Max unread threads per building (label):';
-    const npcInput = document.createElement('input');
-    npcInput.type = 'number';
-    npcInput.min = '10'; npcInput.max = '1000'; npcInput.step = '10';
-    npcInput.value = String(this.getThreadLimit());
-    npcInput.style.cssText = 'background:#0b0b0b; color:#eee; border:1px solid #333; border-radius:5px; padding:5px 8px; font:13px ui-monospace,Consolas,monospace; width:80px;';
-    npcInput.addEventListener('change', () => {
-      const v = parseInt(npcInput.value, 10);
-      if (Number.isFinite(v) && v > 0) {
-        this.setThreadLimit(v);
-        npcStatus.textContent = `Saved. Click Apply to re-spawn NPCs against the new cap.`;
-      }
-    });
-    const applyBtn = document.createElement('button');
-    applyBtn.textContent = 'Apply (re-spawn)';
-    applyBtn.style.cssText = 'background:#1f3a5f; color:#fff; border:1px solid #2c5688; border-radius:5px; padding:5px 12px; cursor:pointer; font:600 12px ui-sans-serif,system-ui,sans-serif;';
-    const npcStatus = document.createElement('span');
-    npcStatus.style.cssText = 'color:#888; font:11px ui-monospace,Consolas,monospace;';
-    applyBtn.addEventListener('click', async () => {
-      applyBtn.disabled = true; npcStatus.textContent = 'Refreshing inbox + re-spawning…';
-      try {
-        this.emailCache.clear();
-        await this.respawnEmailNPCs();
-        npcStatus.textContent = `Done. ${this.npcs.length} NPCs spawned.`;
-      } catch (err) {
-        npcStatus.textContent = `Failed: ${err}`;
-      } finally {
-        applyBtn.disabled = false;
-      }
-    });
-    npcRow.appendChild(npcLabel);
-    npcRow.appendChild(npcInput);
-    npcRow.appendChild(applyBtn);
-    npcRow.appendChild(npcStatus);
-    body.appendChild(npcRow);
-
-    // ---- Local thread cache ----
-    // Saves fetched threads to localStorage so a page reload doesn't
-    // re-fetch from Gmail until the TTL expires. The single biggest
-    // reason quota stays under control during dev iteration.
-    body.appendChild(this.sectionLabel('Local cache'));
-    const cacheRow = document.createElement('div');
-    cacheRow.style.cssText = 'display:flex; gap:10px; align-items:center; flex-wrap:wrap;';
-    const cacheLabel = document.createElement('label');
-    cacheLabel.style.cssText = 'color:#ccc; font:13px ui-sans-serif,system-ui,sans-serif;';
-    cacheLabel.textContent = 'Cache TTL (minutes, 0 = disable):';
-    const ttlMin = Math.round(this.getCacheTtlMs() / 60_000);
-    const cacheInput = document.createElement('input');
-    cacheInput.type = 'number'; cacheInput.min = '0'; cacheInput.max = '1440'; cacheInput.step = '1';
-    cacheInput.value = String(ttlMin);
-    cacheInput.style.cssText = 'background:#0b0b0b; color:#eee; border:1px solid #333; border-radius:5px; padding:5px 8px; font:13px ui-monospace,Consolas,monospace; width:70px;';
-    cacheInput.addEventListener('change', () => {
-      const v = parseInt(cacheInput.value, 10);
-      if (Number.isFinite(v) && v >= 0) {
-        try { localStorage.setItem(VillageScene.CACHE_TTL_KEY, String(v)); } catch {}
-        cacheStatus.textContent = `Saved. New TTL: ${v} min.`;
-      }
-    });
-    const clearCacheBtn = document.createElement('button');
-    clearCacheBtn.textContent = 'Clear cache + re-fetch';
-    clearCacheBtn.style.cssText = 'background:#3b1f1f; color:#fcc; border:1px solid #5a2a2a; border-radius:5px; padding:5px 12px; cursor:pointer; font:600 12px ui-sans-serif,system-ui,sans-serif;';
-    const cacheStatus = document.createElement('span');
-    cacheStatus.style.cssText = 'color:#888; font:11px ui-monospace,Consolas,monospace;';
-    // Show how big the persistent cache currently is.
-    const summarizeCache = () => {
-      let count = 0, bytes = 0;
-      for (let i = 0; i < localStorage.length; i++) {
-        const k = localStorage.key(i);
-        if (!k || !k.startsWith('little_town.threads.')) continue;
-        count++;
-        bytes += (localStorage.getItem(k) || '').length;
-      }
-      cacheStatus.textContent = `${count} label${count === 1 ? '' : 's'} cached · ${(bytes / 1024).toFixed(0)} KB`;
-    };
-    summarizeCache();
-    clearCacheBtn.addEventListener('click', async () => {
-      clearCacheBtn.disabled = true;
-      const cleared = this.clearPersistentCache();
-      cacheStatus.textContent = `Cleared ${cleared} cached labels. Refetching…`;
-      try { await this.respawnEmailNPCs(); summarizeCache(); }
-      catch (err) { cacheStatus.textContent = `Refetch failed: ${err}`; }
-      finally { clearCacheBtn.disabled = false; }
-    });
-    cacheRow.appendChild(cacheLabel);
-    cacheRow.appendChild(cacheInput);
-    cacheRow.appendChild(clearCacheBtn);
-    cacheRow.appendChild(cacheStatus);
-    body.appendChild(cacheRow);
+    // NPC Display Limit, Cache TTL, and Clear-cache rows are gone —
+    // the local-first migration moved threads to SQLite, so per-label
+    // caches with TTLs are no longer a thing. The bottom status bar
+    // (see status_bar.ts) shows live sync progress instead.
 
     // ---- Player avatar ----
     body.appendChild(this.sectionLabel('Player avatar'));

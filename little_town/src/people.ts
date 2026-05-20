@@ -56,27 +56,82 @@ export interface Person {
 
 const STORAGE_KEY = 'little_town.people';
 
+// In-memory cache hydrated lazily from /api/people-overrides. Writes
+// flow through /api/people-overrides/:email. Synchronous read API
+// preserved (the rest of the codebase calls loadOverrides() inline) —
+// callers must await hydratePeopleOverrides() once at bootstrap before
+// the first sync read. Falls back to {} until then.
+
+import { api } from './api';
+
+const cache = new Map<string, PersonOverride>();
+let hydrating: Promise<void> | null = null;
+
+async function hydrateOnce(): Promise<void> {
+  if (hydrating) return hydrating;
+  hydrating = (async () => {
+    try {
+      const fromApi = await api.peopleOverrides.list();
+      for (const [k, v] of Object.entries(fromApi)) {
+        if (v && typeof v === 'object') cache.set(k.toLowerCase(), v as PersonOverride);
+      }
+      // One-shot migration of legacy localStorage blob if the API is
+      // empty (first launch after the SQLite migration ships).
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (raw && cache.size === 0) {
+          const legacy = JSON.parse(raw) as Record<string, PersonOverride>;
+          let n = 0;
+          for (const [k, v] of Object.entries(legacy)) {
+            if (!v || typeof v !== 'object') continue;
+            const key = k.toLowerCase();
+            cache.set(key, v);
+            api.peopleOverrides.put(key, v).catch(err => console.warn('[people] migrate failed', key, err));
+            n++;
+          }
+          if (n > 0) console.log(`[people] migrated ${n} overrides from localStorage to SQLite`);
+          localStorage.removeItem(STORAGE_KEY);
+        }
+      } catch (err) {
+        console.warn('[people] localStorage migration skipped:', err);
+      }
+    } catch (err) {
+      console.warn('[people] API hydrate failed, running in offline mode:', err);
+    }
+  })();
+  return hydrating;
+}
+
+export async function hydratePeopleOverrides(): Promise<void> {
+  await hydrateOnce();
+}
+
 export function loadOverrides(): Record<string, PersonOverride> {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? JSON.parse(raw) : {};
-  } catch { return {}; }
+  // Object.fromEntries on the cache gives every caller a fresh-looking
+  // map without leaking the Map reference.
+  return Object.fromEntries(cache);
 }
 
 export function saveOverride(email: string, override: PersonOverride): void {
   const key = email.toLowerCase();
-  const all = loadOverrides();
-  // Drop empty overrides to keep storage tidy.
+  // Drop empty fields to keep storage tidy.
   const cleaned: PersonOverride = {};
   if (override.name?.trim()) cleaned.name = override.name.trim();
   if (override.charKey) cleaned.charKey = override.charKey;
   if (override.notes?.trim()) cleaned.notes = override.notes.trim();
   if (Object.keys(cleaned).length === 0) {
-    delete all[key];
+    cache.delete(key);
+    // Sending an empty PUT just resets the row to all-NULL columns;
+    // ok for our purposes. We don't bother with a separate DELETE
+    // endpoint since the row is effectively no-op.
+    api.peopleOverrides.put(key, {}).catch(err => console.warn('[people] clear failed', key, err));
   } else {
-    all[key] = cleaned;
+    cache.set(key, cleaned);
+    api.peopleOverrides.put(key, cleaned).catch(err => {
+      console.warn(`[people] save failed for ${key}:`, err);
+      try { (window as any).townStatus?.set?.(`Person save failed: ${err}`, { tone: 'err', ttlMs: 4000 }); } catch {}
+    });
   }
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(all)); } catch {}
 }
 
 // Canonical lookup: a person's sprite, name, etc., wherever they're

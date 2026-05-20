@@ -174,4 +174,34 @@ export const api = {
                   }),
   deleteFilter: (prefixedId: string) =>
                   request<{ success: boolean; account: string }>(`/api/filters/${encodeURIComponent(prefixedId)}`, { method: 'DELETE' }),
+
+  // ---- Gameplay state persisted in SQLite (was localStorage) ----
+  // The renderer used to keep building bindings, avatars, and people
+  // overrides in localStorage. These get wiped on every origin change
+  // (Vite dev vs packaged Electron, two machines, browser cleanup,
+  // etc.), so the canonical store moved into the same SQLite file
+  // that holds the threads they refer to.
+
+  buildings: {
+    list: () => request<Record<string, { customName: string | null; labels: string[] }>>('/api/buildings'),
+    put:  (id: number | string, body: { customName?: string | null; labels?: string[] }) =>
+            request<{ success: boolean; building: { buildingId: number; customName: string | null; labels: string[] } }>(
+              `/api/buildings/${encodeURIComponent(String(id))}`,
+              { method: 'PUT', body: JSON.stringify(body) },
+            ),
+  },
+  avatars: {
+    list:   () => request<Record<string, { body: string | null; eyes: string | null; outfit: string | null; hairstyle: string | null; accessory: string | null }>>('/api/avatars'),
+    put:    (email: string, cfg: { body?: string | null; eyes?: string | null; outfit?: string | null; hairstyle?: string | null; accessory?: string | null }) =>
+              request<{ success: boolean }>(`/api/avatars/${encodeURIComponent(email)}`, { method: 'PUT', body: JSON.stringify(cfg) }),
+    remove: (email: string) =>
+              request<{ success: boolean }>(`/api/avatars/${encodeURIComponent(email)}`, { method: 'DELETE' }),
+  },
+  peopleOverrides: {
+    list: () => request<Record<string, any>>('/api/people-overrides'),
+    put:  (email: string, ov: any) =>
+            request<{ success: boolean }>(`/api/people-overrides/${encodeURIComponent(email)}`, {
+              method: 'PUT', body: JSON.stringify(ov),
+            }),
+  },
 };

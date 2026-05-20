@@ -12,7 +12,7 @@ import express from 'express';
 import { google } from 'googleapis';
 import { requireAuth, dropAccountForInvalidGrant } from './auth.js';
 import { parseMessage, extractUnsubscribe } from '../gmail/parseMessage.js';
-import { labelsRepo, threadsRepo, messagesRepo, queryRepo, statusRepo } from '../db/repositories.js';
+import { labelsRepo, threadsRepo, messagesRepo, queryRepo, statusRepo, bindingsRepo, avatarsRepo, peopleOverridesRepo } from '../db/repositories.js';
 import { applyAndEnqueueModify, applyAndEnqueueMarkRead } from '../services/mutationQueue.js';
 import { gmailLimiter } from '../services/rateLimiter.js';
 
@@ -80,6 +80,58 @@ function handleGmailError(err, res, action, account) {
 // auth check — anyone with localhost access already has the data.
 router.get('/sync-status', (_req, res) => {
   res.json(statusRepo.snapshot());
+});
+
+// ---------------- gameplay state (was in localStorage) ----------------
+// Buildings, avatars, and people overrides used to live in
+// localStorage. They got wiped on every origin change (notably the
+// switch from Vite dev to packaged Electron). Now persisted alongside
+// the Gmail data so they survive any future rebuild / re-install.
+//
+// All localhost-only; no auth check (matches /sync-status). Pure SQL,
+// sub-millisecond.
+
+router.get('/buildings', (_req, res) => {
+  // Returns a map keyed by buildingId for fast lookup on the renderer.
+  const out = {};
+  for (const b of bindingsRepo.all()) {
+    out[b.buildingId] = { customName: b.customName, labels: b.labels };
+  }
+  res.json(out);
+});
+
+router.put('/buildings/:id', (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: 'building id must be numeric' });
+  const { customName, labels } = req.body || {};
+  if (labels !== undefined && !Array.isArray(labels)) {
+    return res.status(400).json({ error: 'labels must be an array of strings' });
+  }
+  bindingsRepo.upsert(id, { customName, labels: labels ?? [] });
+  res.json({ success: true, building: bindingsRepo.get(id) });
+});
+
+router.get('/avatars', (_req, res) => res.json(avatarsRepo.all()));
+
+router.put('/avatars/:email', (req, res) => {
+  const email = req.params.email;
+  if (!email) return res.status(400).json({ error: 'email required' });
+  avatarsRepo.upsert(email, req.body || {});
+  res.json({ success: true, avatar: avatarsRepo.get(email) });
+});
+
+router.delete('/avatars/:email', (req, res) => {
+  avatarsRepo.remove(req.params.email);
+  res.json({ success: true });
+});
+
+router.get('/people-overrides', (_req, res) => res.json(peopleOverridesRepo.all()));
+
+router.put('/people-overrides/:email', (req, res) => {
+  const email = req.params.email;
+  if (!email) return res.status(400).json({ error: 'email required' });
+  peopleOverridesRepo.upsert(email, req.body || {});
+  res.json({ success: true, override: peopleOverridesRepo.get(email) });
 });
 
 // ---------------- profile (multi) ----------------

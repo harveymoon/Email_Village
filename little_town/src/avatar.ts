@@ -61,34 +61,92 @@ async function loadManifest(layer: LayerKey): Promise<string[]> {
   return manifestCache[layer]!;
 }
 
-// ---------- storage ----------
-function loadAll(): Record<string, AvatarConfig> {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? JSON.parse(raw) : {};
-  } catch { return {}; }
+// ---------- storage (API-backed; was localStorage) ----------
+//
+// Single in-memory map, populated lazily from /api/avatars on first
+// read. Writes go through /api/avatars/:email and update the map. The
+// API contract is fire-and-forget (we don't await before resolving
+// saveAvatar) — any failure surfaces on the status bar via the catch
+// below but doesn't block the rest of the UI.
+//
+// One-shot migration: if localStorage still holds the legacy
+// `little_town.avatars` blob, we POST every entry to the backend the
+// first time we hydrate, then delete the localStorage key.
+
+import { api } from './api';
+
+const cache = new Map<string, AvatarConfig>();
+let hydrating: Promise<void> | null = null;
+
+async function hydrateOnce(): Promise<void> {
+  if (hydrating) return hydrating;
+  hydrating = (async () => {
+    try {
+      const fromApi = await api.avatars.list();
+      for (const [k, v] of Object.entries(fromApi)) {
+        if (v && typeof v === 'object') cache.set(k.toLowerCase(), v as AvatarConfig);
+      }
+      // Migrate legacy localStorage blob if present and the API store
+      // is empty (first launch after the SQLite migration ships).
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (raw && cache.size === 0) {
+          const legacy = JSON.parse(raw) as Record<string, AvatarConfig>;
+          let n = 0;
+          for (const [k, v] of Object.entries(legacy)) {
+            if (!v || typeof v !== 'object') continue;
+            const key = k.toLowerCase();
+            cache.set(key, v);
+            api.avatars.put(key, v).catch(err => console.warn('[avatar] migrate failed', key, err));
+            n++;
+          }
+          if (n > 0) console.log(`[avatar] migrated ${n} avatars from localStorage to SQLite`);
+          localStorage.removeItem(STORAGE_KEY);
+        }
+      } catch (err) {
+        console.warn('[avatar] localStorage migration skipped:', err);
+      }
+    } catch (err) {
+      console.warn('[avatar] API hydrate failed, running in offline mode:', err);
+    }
+  })();
+  return hydrating;
 }
-function saveAll(all: Record<string, AvatarConfig>): void {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(all)); } catch {}
-}
+
+// Synchronous lookup — only returns a result if the cache has been
+// hydrated (by an earlier call to ensureAvatar / saveAvatar that
+// awaited). Callers that need a guaranteed-fresh read should await
+// hydrateOnce() first or use the async hydrateAvatars() helper below.
 export function loadAvatar(email: string): AvatarConfig | null {
-  return loadAll()[email.toLowerCase()] || null;
+  return cache.get(email.toLowerCase()) || null;
 }
+
+// Async hydrate hook — exposed so the scene bootstrap can wait for the
+// initial API fetch + migration before spawning NPCs. After this
+// resolves, all subsequent loadAvatar() calls are sync.
+export async function hydrateAvatars(): Promise<void> {
+  await hydrateOnce();
+}
+
 export function saveAvatar(email: string, cfg: AvatarConfig): void {
   const key = email.toLowerCase();
-  const all = loadAll();
   // Skip the write + the event dispatch entirely if the config didn't
   // actually change. Without this guard a buggy patch path that saves
   // an unchanged config can trigger a save → avatar:updated →
   // refreshNpcsForEmail → ensureAvatar → save loop that locks the
   // browser tab. Compare key-by-key so undefined fields don't differ
   // from absent ones across JSON roundtrips.
-  const prev = all[key];
+  const prev = cache.get(key);
   const KEYS: Array<keyof AvatarConfig> = ['body', 'eyes', 'outfit', 'hairstyle', 'accessory'];
   const same = prev && KEYS.every(k => (prev as any)[k] === (cfg as any)[k]);
   if (same) return;
-  all[key] = cfg;
-  saveAll(all);
+  cache.set(key, cfg);
+  // Fire-and-forget write-through to SQLite. Status bar surfaces
+  // failures via the global townStatus.set hook.
+  api.avatars.put(key, cfg).catch(err => {
+    console.warn(`[avatar] save failed for ${key}:`, err);
+    try { (window as any).townStatus?.set?.(`Avatar save failed: ${err}`, { tone: 'err', ttlMs: 4000 }); } catch {}
+  });
   try {
     document.dispatchEvent(new CustomEvent('avatar:updated', { detail: { email: key } }));
   } catch { /* non-DOM env (tests etc.) — ignore */ }

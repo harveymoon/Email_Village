@@ -252,6 +252,182 @@ export const messagesRepo = {
   forThread: (threadId) => messagesStmts.forThread.all(threadId),
 };
 
+// ---------- building bindings (gameplay state) ----------
+const bindingsStmts = {
+  upsert: db.prepare(`
+    INSERT INTO building_bindings(building_id, custom_name, labels_json, updated_at)
+    VALUES (@building_id, @custom_name, @labels_json, @ts)
+    ON CONFLICT(building_id) DO UPDATE SET
+      custom_name = COALESCE(excluded.custom_name, building_bindings.custom_name),
+      labels_json = excluded.labels_json,
+      updated_at  = excluded.updated_at
+  `),
+  // Variant that lets the caller clear custom_name explicitly (PUT with
+  // customName: null). Distinct prepared statement because the COALESCE
+  // version above protects against accidental overwrites from a
+  // partial-update PUT (labels-only or name-only).
+  upsertWithExplicitName: db.prepare(`
+    INSERT INTO building_bindings(building_id, custom_name, labels_json, updated_at)
+    VALUES (@building_id, @custom_name, @labels_json, @ts)
+    ON CONFLICT(building_id) DO UPDATE SET
+      custom_name = excluded.custom_name,
+      labels_json = excluded.labels_json,
+      updated_at  = excluded.updated_at
+  `),
+  get: db.prepare(`SELECT * FROM building_bindings WHERE building_id = ?`),
+  all: db.prepare(`SELECT * FROM building_bindings`),
+};
+
+export const bindingsRepo = {
+  /** Upsert one binding. If customName is undefined, the existing custom_name is preserved. */
+  upsert(buildingId, { customName, labels }) {
+    const stmt = customName === undefined ? bindingsStmts.upsert : bindingsStmts.upsertWithExplicitName;
+    stmt.run({
+      building_id: Number(buildingId),
+      custom_name: customName === undefined ? null : customName,
+      labels_json: JSON.stringify(Array.isArray(labels) ? labels : []),
+      ts: now(),
+    });
+  },
+  get(buildingId) {
+    const row = bindingsStmts.get.get(Number(buildingId));
+    if (!row) return null;
+    return {
+      buildingId: row.building_id,
+      customName: row.custom_name,
+      labels: JSON.parse(row.labels_json || '[]'),
+    };
+  },
+  all() {
+    return bindingsStmts.all.all().map(row => ({
+      buildingId: row.building_id,
+      customName: row.custom_name,
+      labels: JSON.parse(row.labels_json || '[]'),
+    }));
+  },
+};
+
+// ---------- avatars (per-email layered character config) ----------
+const avatarsStmts = {
+  upsert: db.prepare(`
+    INSERT INTO avatars(email, body, eyes, outfit, hairstyle, accessory, updated_at)
+    VALUES (@email, @body, @eyes, @outfit, @hairstyle, @accessory, @ts)
+    ON CONFLICT(email) DO UPDATE SET
+      body       = excluded.body,
+      eyes       = excluded.eyes,
+      outfit     = excluded.outfit,
+      hairstyle  = excluded.hairstyle,
+      accessory  = excluded.accessory,
+      updated_at = excluded.updated_at
+  `),
+  get: db.prepare(`SELECT * FROM avatars WHERE email = ?`),
+  all: db.prepare(`SELECT * FROM avatars`),
+  remove: db.prepare(`DELETE FROM avatars WHERE email = ?`),
+};
+
+function rowToAvatar(row) {
+  if (!row) return null;
+  return {
+    body: row.body,
+    eyes: row.eyes,
+    outfit: row.outfit,
+    hairstyle: row.hairstyle,
+    accessory: row.accessory,
+  };
+}
+
+export const avatarsRepo = {
+  upsert(email, cfg) {
+    avatarsStmts.upsert.run({
+      email: email.toLowerCase(),
+      body: cfg?.body ?? null,
+      eyes: cfg?.eyes ?? null,
+      outfit: cfg?.outfit ?? null,
+      hairstyle: cfg?.hairstyle ?? null,
+      accessory: cfg?.accessory ?? null,
+      ts: now(),
+    });
+  },
+  get: (email) => rowToAvatar(avatarsStmts.get.get(email.toLowerCase())),
+  all() {
+    const out = {};
+    for (const row of avatarsStmts.all.all()) out[row.email] = rowToAvatar(row);
+    return out;
+  },
+  remove: (email) => avatarsStmts.remove.run(email.toLowerCase()),
+};
+
+// ---------- people overrides (per-email display name / notes / contacts) ----------
+const peopleStmts = {
+  upsert: db.prepare(`
+    INSERT INTO people_overrides(
+      email, name, char_key, notes,
+      emails_json, phones_json, urls_json, birthday, extra_json, updated_at
+    ) VALUES (
+      @email, @name, @char_key, @notes,
+      @emails_json, @phones_json, @urls_json, @birthday, @extra_json, @ts
+    )
+    ON CONFLICT(email) DO UPDATE SET
+      name        = excluded.name,
+      char_key    = excluded.char_key,
+      notes       = excluded.notes,
+      emails_json = excluded.emails_json,
+      phones_json = excluded.phones_json,
+      urls_json   = excluded.urls_json,
+      birthday    = excluded.birthday,
+      extra_json  = excluded.extra_json,
+      updated_at  = excluded.updated_at
+  `),
+  get: db.prepare(`SELECT * FROM people_overrides WHERE email = ?`),
+  all: db.prepare(`SELECT * FROM people_overrides`),
+  remove: db.prepare(`DELETE FROM people_overrides WHERE email = ?`),
+};
+
+function rowToOverride(row) {
+  if (!row) return null;
+  const ov = {};
+  if (row.name) ov.name = row.name;
+  if (row.char_key) ov.charKey = row.char_key;
+  if (row.notes) ov.notes = row.notes;
+  if (row.birthday) ov.birthday = row.birthday;
+  if (row.emails_json) ov.emails = JSON.parse(row.emails_json);
+  if (row.phones_json) ov.phones = JSON.parse(row.phones_json);
+  if (row.urls_json) ov.urls = JSON.parse(row.urls_json);
+  if (row.extra_json) {
+    try { Object.assign(ov, JSON.parse(row.extra_json)); } catch { /* ignore bad extras */ }
+  }
+  return ov;
+}
+
+export const peopleOverridesRepo = {
+  upsert(email, ov) {
+    // Anything not modelled as a column gets stuffed into extra_json so
+    // we don't lose fields the renderer may add in the future.
+    const known = new Set(['name', 'charKey', 'notes', 'emails', 'phones', 'urls', 'birthday']);
+    const extras = {};
+    for (const [k, v] of Object.entries(ov || {})) if (!known.has(k)) extras[k] = v;
+    peopleStmts.upsert.run({
+      email: email.toLowerCase(),
+      name: ov?.name ?? null,
+      char_key: ov?.charKey ?? null,
+      notes: ov?.notes ?? null,
+      emails_json: ov?.emails ? JSON.stringify(ov.emails) : null,
+      phones_json: ov?.phones ? JSON.stringify(ov.phones) : null,
+      urls_json: ov?.urls ? JSON.stringify(ov.urls) : null,
+      birthday: ov?.birthday ?? null,
+      extra_json: Object.keys(extras).length ? JSON.stringify(extras) : null,
+      ts: now(),
+    });
+  },
+  get: (email) => rowToOverride(peopleStmts.get.get(email.toLowerCase())),
+  all() {
+    const out = {};
+    for (const row of peopleStmts.all.all()) out[row.email] = rowToOverride(row);
+    return out;
+  },
+  remove: (email) => peopleStmts.remove.run(email.toLowerCase()),
+};
+
 // ---------- list/aggregate queries (read-side) ----------
 //
 // All return rows shaped as close as possible to what the legacy

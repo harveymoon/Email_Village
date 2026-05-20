@@ -135,19 +135,35 @@ async function drainOnce() {
         mutationQueueRepo.markFailed(row.id, msg);
         return;
       }
-      // Transient / rate-limited / 5xx: bump retry counter, leave pending.
+      // Quota errors (429 / Too many concurrent / userRateLimit) are
+      // intrinsically transient — they say "your account hit a quota
+      // window", not "this request is wrong". Never give up on them:
+      // bump the retry counter, leave the row pending, and let the
+      // limiter widen the gap before the next attempt. If we DID give
+      // up on these, the local DB would say "moved" while Gmail still
+      // says "in INBOX", and the next backfill (which re-fetches
+      // threads.get from Gmail) would silently overwrite the local
+      // move — exactly the bug the user reported as "I triaged 5000
+      // emails down to 0 then rebooted and it's back to 18,109".
+      const isQuota = /quota|rate.?limit|429|userRateLimit|too many concurrent/i.test(msg);
       const attempts = (row.attempts || 0) + 1;
-      if (attempts >= MAX_ATTEMPTS_BEFORE_FAIL) {
-        console.warn(`[queue] giving up on #${row.id} after ${attempts} attempts: ${msg}`);
+      if (!isQuota && attempts >= MAX_ATTEMPTS_BEFORE_FAIL) {
+        console.warn(`[queue] giving up on #${row.id} after ${attempts} attempts (non-quota): ${msg}`);
         mutationQueueRepo.markFailed(row.id, msg);
         return;
       }
+      if (isQuota && attempts % 10 === 0) {
+        // Don't spam — every 10th retry log a brief status so the user
+        // knows the queue is alive and waiting on quota.
+        const status = queueStatus();
+        console.log(`[queue] #${row.id} still waiting on quota (attempt ${attempts}); ${status.pending} pending`);
+      }
       // Effective backoff via the limiter: take an exponentially larger
       // gulp of tokens so the next tick of THIS row is naturally delayed.
-      // (We can't directly schedule per-row delay from here without more
-      // infrastructure; the limiter is good enough for v1.)
+      // Cap at 120s — past that the backfill is probably what's eating
+      // quota, and a bigger sleep here just stalls forever.
       mutationQueueRepo.bumpRetry(row.id, msg);
-      const backoffSec = Math.min(64, 2 ** attempts);
+      const backoffSec = Math.min(120, 2 ** Math.min(attempts, 7));
       await gmailLimiter.take(backoffSec * 5);
     }
   }));
@@ -155,6 +171,15 @@ async function drainOnce() {
 
 export function startMutationDrain() {
   if (drainHandle) return;
+  // Resurrect any rows stuck inflight (backend crashed mid-tick) or
+  // marked failed by previous runs. Without this, every restart left
+  // a growing pile of "permanently stuck" mutations that the local DB
+  // believed had succeeded — the moves looked fine in the UI but
+  // never propagated to Gmail. On the next backfill the threads.get
+  // round-trips replaced those local labels with what Gmail still
+  // said, silently undoing the user's work.
+  try { mutationQueueRepo.resurrectStuckRows(); }
+  catch (err) { console.warn('[queue] resurrect failed:', err.message); }
   drainHandle = setInterval(() => {
     drainOnce().catch(err => console.warn('[queue] drain tick failed:', err.message));
   }, DRAIN_TICK_MS);

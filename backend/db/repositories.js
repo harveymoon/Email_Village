@@ -676,6 +676,17 @@ const queueStmts = {
   bumpRetry: db.prepare(`UPDATE mutation_queue SET status = 'pending', attempts = attempts + 1, last_error = ?, last_attempt_at = ? WHERE id = ?`),
   remove: db.prepare(`DELETE FROM mutation_queue WHERE id = ?`),
   countPending: db.prepare(`SELECT COUNT(*) AS n FROM mutation_queue WHERE status = 'pending'`),
+  countByStatus: db.prepare(`SELECT status, COUNT(*) AS n FROM mutation_queue GROUP BY status`),
+  // Reset any rows stuck inflight (backend crashed mid-tick) AND
+  // resurrect rows we gave up on for transient errors so they get
+  // another shot. We don't loop forever — `attempts` keeps growing so
+  // an honestly-broken op eventually settles down to "tried often,
+  // still failing" rather than "spinning at 100% retry rate".
+  resurrect: db.prepare(`
+    UPDATE mutation_queue
+       SET status = 'pending'
+     WHERE status IN ('inflight', 'failed')
+  `),
 };
 
 export const mutationQueueRepo = {
@@ -694,6 +705,16 @@ export const mutationQueueRepo = {
   markInflight: (id) => queueStmts.markInflight.run(now(), id),
   markFailed: (id, err) => queueStmts.markFailed.run(String(err).slice(0, 500), now(), id),
   bumpRetry: (id, err) => queueStmts.bumpRetry.run(String(err).slice(0, 500), now(), id),
+  /** Reset stuck/failed rows back to pending. Called on startup. */
+  resurrectStuckRows() {
+    const before = queueStmts.countByStatus.all();
+    const stuck = before.filter(r => r.status === 'inflight' || r.status === 'failed');
+    if (!stuck.length) return 0;
+    const total = stuck.reduce((a, r) => a + r.n, 0);
+    queueStmts.resurrect.run();
+    console.log(`[queue] resurrected ${total} stuck rows (${stuck.map(r => `${r.n} ${r.status}`).join(', ')}) — will retry`);
+    return total;
+  },
   remove: (id) => queueStmts.remove.run(id),
   countPending: () => queueStmts.countPending.get().n,
 };
